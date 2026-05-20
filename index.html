@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="description" content="TideGS supplementary website with city-scale video visualizations and method comparisons.">
+  <meta name="keywords" content="TideGS, 3D Gaussian Splatting, out-of-core optimization, MatrixCity, Google Earth Rome">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <title>TideGS | Over One Billion 3D Gaussian Splatting Primitives</title>
+  <link rel="icon" type="image/png" href="./static/images/logo.png">
+
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Roboto+Mono|Castoro" rel="stylesheet">
+  <link rel="stylesheet" href="./static/css/bulma.min.css">
+  <link rel="stylesheet" href="./static/css/index.css">
+
+  <meta property="og:title" content="TideGS">
+  <meta property="og:description" content="Scalable training of over one billion 3D Gaussian Splatting primitives via out-of-core optimization.">
+  <meta property="og:image" content="./static/images/overview.png">
+</head>
+
+<body>
+  <section class="hero is-link is-fullheight video" id="top" style="overflow: hidden; position:relative;">
+    <div class="hero-video" style="height: 100%; width: 177.77777778vh; min-width: 100%;min-height: 56.25vw;">
+      <video playsinline autoplay muted loop>
+        <source src="./static/videos/city_gallery/big_city_teaser_hero.mp4" type="video/mp4">
+      </video>
+    </div>
+    <div class="hero-video is-hidden-tablet is-inline-block-mobile"
+      style="height: 154.28571428vw; width: 100%; min-width:64.81481481vh;min-height:100%;">
+      <video playsinline autoplay muted loop>
+        <source src="./static/videos/city_gallery/big_city_teaser_hero.mp4" type="video/mp4">
+      </video>
+    </div>
+    <div class="overlay"></div>
+
+    <div class="hero-head is-hidden-mobile">
+      <header class="navbar hero-navbar">
+        <div class="container">
+          <nav class="hero-nav" aria-label="Primary navigation">
+            <a href="#project-video">Project Video</a>
+            <a href="#city-video-gallery">Gallery</a>
+            <a href="#visual-quality-comparison">Comparison</a>
+            <a href="#BibTeX">BibTeX</a>
+          </nav>
+        </div>
+      </header>
+    </div>
+
+    <div class="hero-body">
+      <div class="container has-text-centered">
+        <h1 class="title is-1 publication-title is-size-1-mobile hero-title">
+          <span>TideGS</span>
+        </h1>
+        <h1 class="subtitle is-1 publication-title is-size-4-mobile hero-subtitle">
+          <span class="hero-subtitle-line">Scalable Training of <span class="title-emphasis">Over One Billion</span> 3D Gaussian Splatting</span>
+          <span class="hero-subtitle-line">Primitives via Out-of-Core Optimization</span>
+        </h1>
+      </div>
+    </div>
+  </section>
+
+  <section class="hero publication-header">
+    <div class="toc">
+      <h3>Content</h3>
+      <hr>
+      <ul>
+        <li><a href="#project-video">Project Video</a></li>
+        <li><a href="#abstract">Abstract</a></li>
+        <li><a href="#city-video-gallery">Video Gallery</a></li>
+        <li><a href="#visual-quality-comparison">Visual Quality Comparison</a></li>
+        <li><a href="#matrixcity-baseline-demo">Method Comparison Gallery</a></li>
+        <li><a href="#method">Method Overview</a></li>
+        <li><a href="#BibTeX">BibTeX</a></li>
+      </ul>
+    </div>
+
+    <div class="hero-body">
+      <div class="container">
+        <div class="columns is-centered">
+          <div class="column has-text-centered">
+            <div class="publication-meta-block">
+              <img class="publication-logo" src="./static/images/logo.png" alt="TideGS logo">
+              <h1 class="title is-2 publication-title formal-publication-title">
+                TideGS: Scalable Training of Over One Billion<br>
+                3D Gaussian Splatting Primitives<br>
+                via Out-of-Core Optimization
+              </h1>
+              <p class="publication-venue">ICML 2026</p>
+              <div class="is-size-5 publication-authors">
+                <span class="author-block">Chonghao Zhong<sup>1</sup></span>
+                <span class="author-block">Linfeng Shi<sup>1</sup></span>
+                <span class="author-block">Hua Chen<sup>2</sup></span>
+                <span class="author-block">Tiecheng Sun<sup>2</sup></span>
+                <span class="author-block">Hao Zhao<sup>3,4</sup></span>
+                <span class="author-block">Binhang Yuan<sup>* 1</sup></span>
+                <span class="author-block">Chaojian Li<sup>* 1</sup></span>
+              </div>
+              <div class="publication-affiliations">
+                <span><sup>1</sup>Hong Kong University of Science and Technology</span>
+                <span><sup>2</sup>Great Wall Motor</span>
+                <span><sup>3</sup>Tsinghua University</span>
+                <span><sup>4</sup>Beijing Academy of Artificial Intelligence</span>
+              </div>
+            </div>
+
+            <div class="column has-text-centered">
+              <div class="publication-links">
+                <span class="link-block">
+                  <a href="https://arxiv.org/pdf/2605.20150" target="_blank" rel="noopener noreferrer" class="external-link button is-normal is-rounded is-dark">
+                    <span>Paper</span>
+                  </a>
+                </span>
+                <span class="link-block">
+                  <a href="https://github.com/sponge-lab/TideGS" target="_blank" rel="noopener noreferrer" class="external-link button is-normal is-rounded is-dark">
+                    <span>Code</span>
+                  </a>
+                </span>
+                <span class="link-block">
+                  <a href="#city-video-gallery" class="external-link button is-normal is-rounded is-dark">
+                    <span>Video Gallery</span>
+                  </a>
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="project-video">
+    <div class="container">
+      <div class="columns is-centered">
+        <div class="column is-full-width">
+          <h2 class="title is-2" style="text-align: left; padding-bottom: 10px;">Project Video</h2>
+          <div class="columns is-centered">
+            <div class="column is-full-width has-text-centered project-video-column">
+              <div class="project-video-frame">
+                <video class="project-video-player" controls playsinline preload="metadata">
+                  <source src="./static/videos/teaser_video_v2.mp4" type="video/mp4">
+                </video>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="abstract">
+    <div class="container">
+      <div class="columns is-centered">
+        <div class="column is-four-fifths abstract-column">
+          <h2 class="title is-2" id="abstract-title">Abstract</h2>
+          <figure class="abstract-teaser-figure">
+            <img src="./static/images/teaser_v0_3.png" alt="TideGS city-scale out-of-core training teaser">
+            <figcaption>
+              Figure 1. TideGS targets city-scale 3D Gaussian Splatting with a hybrid SSD-CPU-GPU pipeline, avoiding single-GPU memory failure while sidestepping the cost and complexity of distributed multi-GPU training.
+            </figcaption>
+          </figure>
+          <div class="content has-text-justified abstract-copy">
+            <p>
+              City-scale 3D Gaussian Splatting pushes training beyond the memory budget of a single GPU: a full urban scene can span many square kilometers and require more than one billion Gaussians. Naively loading the entire scene into GPU memory leads to out-of-memory failure, while distributed multi-GPU training introduces substantial engineering complexity and deployment cost.
+            </p>
+            <p>
+              TideGS addresses this scaling bottleneck with a hybrid SSD-CPU-GPU out-of-core training pipeline. The system keeps only the active working set and resident blocks in GPU memory, uses CPU memory for caching and prefetch scheduling, and stores cold scene blocks and update logs on SSD. By overlapping host-to-device prefetch, GPU computation, and device-to-host writeback, TideGS streams scene content through a single-GPU training loop instead of requiring the whole scene to reside in VRAM.
+            </p>
+            <p>
+              This project page summarizes the method through the project video, MatrixCity and Google Earth Rome visualizations, and interactive comparisons against Vanilla 3DGS and CLM.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section dark-section" id="city-video-gallery">
+    <div class="container">
+      <div class="section-heading align-left">
+        <h2 class="section-title">City-scale visualization gallery.</h2>
+        <p class="section-lead">
+          MatrixCity flythroughs and Google Earth Rome TideGS renderings are grouped into the same focused playback wall used in the Tech version.
+        </p>
+      </div>
+
+      <div class="gallery-tabs" role="tablist" aria-label="Video gallery dataset">
+        <button class="gallery-tab active" type="button" data-gallery-group="matrixcity" role="tab" aria-selected="true">MatrixCity</button>
+        <button class="gallery-tab" type="button" data-gallery-group="rome" role="tab" aria-selected="false">Google Earth Rome</button>
+      </div>
+
+      <div class="city-gallery">
+        <div class="city-gallery-stage">
+          <div class="stage-video-frame">
+            <video id="cityGalleryMainVideo" class="city-gallery-main-video" loop playsinline muted controls autoplay preload="metadata">
+              <source src="./static/videos/city_gallery/matrixcity_inland_train.mp4" type="video/mp4">
+            </video>
+          </div>
+          <div class="stage-caption">
+            <p class="mono-label" id="cityGalleryMainIndex">VIDEO 01</p>
+            <h3 id="cityGalleryMainTitle">Inland Quality Flythrough</h3>
+          </div>
+        </div>
+
+        <div class="city-gallery-list" id="cityGalleryList" aria-label="City-scale video selector"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section split-comparison-section" id="visual-quality-comparison">
+    <div class="container">
+      <div class="section-heading">
+        <h2 class="section-title">Visual Quality Comparison</h2>
+        <p class="section-lead split-comparison-lead">
+          Switch scenes and drag the split bar to compare <strong>TideGS</strong> against <strong>Vanilla 3DGS</strong>.
+        </p>
+      </div>
+
+      <div class="split-comparison-card">
+        <div class="comparison-scene-tabs" aria-label="Visual comparison scene selector">
+          <button type="button" class="comparison-scene-tab is-active" aria-label="Scene 1: Inland Quality" title="Inland Quality"
+            data-ours="./static/videos/baseline_ours_comparison/inland_quality/tidegs.mp4"
+            data-baseline="./static/videos/baseline_ours_comparison/inland_quality/vanilla_3dgs.mp4">1</button>
+          <button type="button" class="comparison-scene-tab" aria-label="Scene 2: Overpass City" title="Overpass City"
+            data-ours="./static/videos/baseline_ours_comparison/overpass_city/tidegs.mp4"
+            data-baseline="./static/videos/baseline_ours_comparison/overpass_city/vanilla_3dgs.mp4">2</button>
+          <button type="button" class="comparison-scene-tab" aria-label="Scene 3: North Highrise" title="North Highrise"
+            data-ours="./static/videos/baseline_ours_comparison/north_highrise/tidegs.mp4"
+            data-baseline="./static/videos/baseline_ours_comparison/north_highrise/vanilla_3dgs.mp4">3</button>
+          <button type="button" class="comparison-scene-tab" aria-label="Scene 4: Inner Block" title="Inner Block"
+            data-ours="./static/videos/baseline_ours_comparison/inner_block/tidegs.mp4"
+            data-baseline="./static/videos/baseline_ours_comparison/inner_block/vanilla_3dgs.mp4">4</button>
+        </div>
+        <div class="dual-comparison-wrapper" data-slider="visual-quality-dual">
+          <video class="comparison-video video-baseline" src="./static/videos/baseline_ours_comparison/inland_quality/vanilla_3dgs.mp4" loop playsinline muted autoplay preload="metadata"></video>
+          <video class="comparison-video video-ours" src="./static/videos/baseline_ours_comparison/inland_quality/tidegs.mp4" loop playsinline muted autoplay preload="metadata"></video>
+          <div class="slider-handle" aria-hidden="true"></div>
+          <span class="comparison-label left">TideGS</span>
+          <span class="comparison-label right">Vanilla 3DGS</span>
+        </div>
+      </div>
+
+      <div class="visual-highlight-grid" aria-label="Focused visual quality highlights">
+        <figure class="visual-highlight-card">
+          <img src="./static/images/visual_highlights/scene_1_inland_quality.gif" alt="Scene 1 focused comparison between Vanilla 3DGS and TideGS" loading="lazy">
+          <figcaption>Scene 1</figcaption>
+        </figure>
+        <figure class="visual-highlight-card">
+          <img src="./static/images/visual_highlights/scene_2_overpass_city.gif" alt="Scene 2 focused comparison between Vanilla 3DGS and TideGS" loading="lazy">
+          <figcaption>Scene 2</figcaption>
+        </figure>
+        <figure class="visual-highlight-card">
+          <img src="./static/images/visual_highlights/scene_3_north_highrise.gif" alt="Scene 3 focused comparison between Vanilla 3DGS and TideGS" loading="lazy">
+          <figcaption>Scene 3</figcaption>
+        </figure>
+        <figure class="visual-highlight-card">
+          <img src="./static/images/visual_highlights/scene_4_inner_block.gif" alt="Scene 4 focused comparison between Vanilla 3DGS and TideGS" loading="lazy">
+          <figcaption>Scene 4</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="matrixcity-baseline-demo">
+    <div class="container">
+      <div class="section-heading">
+        <h2 class="section-title" id="matrixcity-demo-title">Method Comparison Gallery</h2>
+        <p class="section-lead" id="matrixcity-demo-subtitle">MatrixCity Dataset</p>
+      </div>
+
+      <div class="gallery-card">
+        <p class="selector-label" id="matrixcity-sample-label">Sample</p>
+        <div id="matrixcity-scene-selector" class="scene-selector" aria-label="MatrixCity sample selector"></div>
+
+        <div class="baseline-video-container">
+          <div class="video-box">
+            <video id="matrixcityVanillaVideo" class="matrixcity-method-video" data-method="vanilla_3dgs" src="./static/videos/matrixcity_video_slice/vanilla_3dgs/1.mp4" loop playsinline muted preload="metadata"></video>
+            <p class="video-label vanilla">Vanilla 3DGS</p>
+          </div>
+          <div class="video-box">
+            <video id="matrixcityClmVideo" class="matrixcity-method-video" data-method="clm" src="./static/videos/matrixcity_video_slice/clm/1.mp4" loop playsinline muted preload="metadata"></video>
+            <p class="video-label clm">CLM</p>
+          </div>
+          <div class="video-box">
+            <video id="matrixcityTidegsVideo" class="matrixcity-method-video" data-method="tidegs" src="./static/videos/matrixcity_video_slice/tidegs/1.mp4" loop playsinline muted preload="metadata"></video>
+            <p class="video-label ours">TideGS (ours)</p>
+          </div>
+        </div>
+
+        <div class="gallery-scrubber-wrap">
+          <p class="scrubber-label">Test View</p>
+          <input type="range" id="matrixcity-scrubber" class="gallery-scrubber-input" min="0" max="1000" value="0" step="1" aria-label="Frame scrubber">
+        </div>
+
+        <p id="matrixcity-demo-description" class="gallery-description">
+          Comparison among <strong>Vanilla 3DGS</strong>, <strong>CLM</strong>, and <strong>TideGS (ours)</strong> on the MatrixCity dataset.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="method">
+    <div class="container">
+      <div class="columns is-centered">
+        <div class="column is-full-width">
+          <h2 class="title is-2" style="text-align: left; padding-bottom: 10px;">Method Overview</h2>
+          <div class="columns is-centered">
+            <div class="column is-four-fifths has-text-centered">
+              <img src="./static/images/overview.png" alt="TideGS method overview" style="width: 100%; border-radius:10px;">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="BibTeX">
+    <div class="container is-max-desktop content">
+      <h2 class="title" style="background: #000; color: #fff; display: inline-block; padding: 8px 16px;">BibTeX</h2>
+      <pre><code>@inproceedings{zhong2026tidegs,
+  title={{TideGS}: Scalable Training of Over One Billion 3D Gaussian Splatting Primitives via Out-of-Core Optimization},
+  author={Zhong, Chonghao and Shi, Linfeng and Chen, Hua and Sun, Tiecheng and Zhao, Hao and Yuan, Binhang and Li, Chaojian},
+  booktitle={International Conference on Machine Learning},
+  year={2026},
+  organization={PMLR}
+}</code></pre>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="content has-text-centered">
+        <p class="footer-attribution">
+          Page template borrowed from
+          <a href="https://nerfies.github.io/" target="_blank" rel="noopener noreferrer">Nerfies</a>
+          and
+          <a href="https://umi-on-legs.github.io/" target="_blank" rel="noopener noreferrer">UMI-On-Legs</a>.
+        </p>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var matrixCityItems = [
+        {
+          group: "matrixcity",
+          index: "VIDEO 01",
+          title: "Inland Quality Flythrough",
+          video: "./static/videos/city_gallery/matrixcity_inland_train.mp4",
+          label: "Inland Quality"
+        },
+        {
+          group: "matrixcity",
+          index: "VIDEO 02",
+          title: "Overpass City Synth Zoom",
+          video: "./static/videos/city_gallery/matrixcity_overpass_city_synth_zoom.mp4",
+          label: "Overpass Zoom"
+        },
+        {
+          group: "matrixcity",
+          index: "VIDEO 03",
+          title: "North Highrise Synth Zoom",
+          video: "./static/videos/city_gallery/matrixcity_north_highrise_synth_zoom.mp4",
+          label: "North Highrise"
+        },
+        {
+          group: "matrixcity",
+          index: "VIDEO 04",
+          title: "Inner Block Synth Zoom",
+          video: "./static/videos/city_gallery/matrixcity_inner_block_synth_zoom.mp4",
+          label: "Inner Block"
+        }
+      ];
+
+      var romeFiles = [
+        "01_snake_row_094_0669.mp4",
+        "02_snake_row_078_0738.mp4",
+        "03_snake_row_052_0293.mp4",
+        "04_snake_row_101_0045.mp4",
+        "06_snake_row_100_0162.mp4",
+        "07_snake_row_086_0644.mp4",
+        "08_snake_row_091_0380.mp4",
+        "09_snake_row_105_0997.mp4",
+        "10_snake_row_094_0351.mp4",
+        "11_snake_row_064_1038.mp4",
+        "12_snake_row_104_0273.mp4",
+        "13_snake_row_108_0419.mp4",
+        "14_snake_row_075_0066.mp4",
+        "15_snake_row_069_0246.mp4",
+        "16_snake_row_070_0666.mp4",
+        "17_snake_row_095_0332.mp4",
+        "18_snake_row_039_0453.mp4",
+        "21_snake_row_057_0292.mp4",
+        "25_snake_row_117_0558.mp4",
+        "26_snake_row_029_0438.mp4",
+        "27_snake_row_069_0759.mp4",
+        "28_snake_row_073_0675.mp4",
+        "29_snake_row_109_0624.mp4",
+        "30_snake_row_096_0928.mp4"
+      ];
+
+      var romeItems = romeFiles.map(function (file, itemIndex) {
+        var index = String(itemIndex + 1).padStart(2, "0");
+        var segment = file.replace(/^\d+_/, "").replace(/\.mp4$/, "");
+        return {
+          group: "rome",
+          index: "ROME " + index,
+          title: "Google Earth Rome View " + index,
+          video: "./static/videos/rome_gallery/" + file,
+          label: "Rome " + index
+        };
+      });
+
+      function safePlay(video) {
+        if (!video) {
+          return;
+        }
+        var playPromise = video.play();
+        if (playPromise && typeof playPromise.catch === "function") {
+          playPromise.catch(function () {});
+        }
+      }
+
+      function setVideoSource(video, path) {
+        if (!video || !path) {
+          return;
+        }
+        video.pause();
+        video.src = path;
+      }
+
+      function primeVideoFrame(video) {
+        if (!video) {
+          return;
+        }
+        function seekPreviewFrame() {
+          if (isFinite(video.duration) && video.duration > 0.4) {
+            try {
+              video.currentTime = Math.min(0.25, video.duration - 0.1);
+            } catch (error) {}
+          }
+        }
+        if (video.readyState >= 1) {
+          seekPreviewFrame();
+        } else {
+          video.addEventListener("loadedmetadata", seekPreviewFrame, { once: true });
+        }
+      }
+
+      function initCityGallery() {
+        var list = document.getElementById("cityGalleryList");
+        var mainVideo = document.getElementById("cityGalleryMainVideo");
+        var mainIndex = document.getElementById("cityGalleryMainIndex");
+        var mainTitle = document.getElementById("cityGalleryMainTitle");
+        var tabs = Array.prototype.slice.call(document.querySelectorAll(".gallery-tab"));
+
+        if (!list || !mainVideo) {
+          return;
+        }
+
+        matrixCityItems.concat(romeItems).forEach(function (item, itemIndex) {
+          var button = document.createElement("button");
+          button.className = "city-gallery-item";
+          button.type = "button";
+          button.hidden = item.group !== "matrixcity";
+          button.dataset.galleryGroup = item.group;
+          button.dataset.index = item.index;
+          button.dataset.title = item.title;
+          button.dataset.video = item.video;
+          if (itemIndex === 0) {
+            button.classList.add("active");
+          }
+
+          var preview = document.createElement("video");
+          preview.muted = true;
+          preview.playsInline = true;
+          preview.loop = true;
+          preview.preload = "metadata";
+          preview.src = item.video;
+
+          var label = document.createElement("span");
+          label.textContent = item.label;
+
+          button.appendChild(preview);
+          button.appendChild(label);
+          list.appendChild(button);
+        });
+
+        var items = Array.prototype.slice.call(list.querySelectorAll(".city-gallery-item"));
+
+        function selectGalleryItem(item) {
+          var nextVideo = item.getAttribute("data-video");
+          if (!nextVideo) {
+            return;
+          }
+          items.forEach(function (button) {
+            button.classList.toggle("active", button === item);
+          });
+          mainVideo.pause();
+          mainVideo.src = nextVideo;
+          mainVideo.load();
+          primeVideoFrame(mainVideo);
+          safePlay(mainVideo);
+          if (mainIndex) {
+            mainIndex.textContent = item.getAttribute("data-index") || "";
+          }
+          if (mainTitle) {
+            mainTitle.textContent = item.getAttribute("data-title") || "";
+          }
+        }
+
+        function setGalleryGroup(group) {
+          tabs.forEach(function (tab) {
+            var active = tab.getAttribute("data-gallery-group") === group;
+            tab.classList.toggle("active", active);
+            tab.setAttribute("aria-selected", active ? "true" : "false");
+          });
+          items.forEach(function (item) {
+            item.hidden = item.getAttribute("data-gallery-group") !== group;
+          });
+          list.classList.toggle("rome-active", group === "rome");
+          list.scrollTop = 0;
+
+          var firstVisible = items.find(function (item) {
+            return item.getAttribute("data-gallery-group") === group;
+          });
+          if (firstVisible) {
+            selectGalleryItem(firstVisible);
+          }
+        }
+
+        items.forEach(function (item) {
+          var preview = item.querySelector("video");
+          primeVideoFrame(preview);
+          item.addEventListener("mouseenter", function () {
+            safePlay(preview);
+          });
+          item.addEventListener("focus", function () {
+            safePlay(preview);
+          });
+          item.addEventListener("mouseleave", function () {
+            if (preview) {
+              preview.pause();
+            }
+          });
+          item.addEventListener("click", function () {
+            selectGalleryItem(item);
+          });
+        });
+
+        tabs.forEach(function (tab) {
+          tab.addEventListener("click", function () {
+            setGalleryGroup(tab.getAttribute("data-gallery-group"));
+          });
+        });
+
+        primeVideoFrame(mainVideo);
+      }
+
+      function loadVideosSync(videos, afterLoad) {
+        var validVideos = videos.filter(Boolean);
+        if (!validVideos.length) {
+          return;
+        }
+
+        var readyCount = 0;
+        function markReady() {
+          readyCount += 1;
+          if (readyCount === validVideos.length) {
+            validVideos.forEach(function (video) {
+              video.currentTime = 0;
+              safePlay(video);
+            });
+            if (afterLoad) {
+              afterLoad();
+            }
+          }
+        }
+
+        validVideos.forEach(function (video) {
+          var handler = function () {
+            video.removeEventListener("canplay", handler);
+            markReady();
+          };
+          video.addEventListener("canplay", handler);
+          video.load();
+          if (video.readyState >= 3) {
+            video.removeEventListener("canplay", handler);
+            window.setTimeout(markReady, 0);
+          }
+        });
+      }
+
+      function syncFollowerVideos(leader, followers) {
+        if (!leader || !followers.length) {
+          return;
+        }
+        leader.addEventListener("play", function () {
+          followers.forEach(function (video) {
+            video.currentTime = leader.currentTime;
+            safePlay(video);
+          });
+        });
+        leader.addEventListener("pause", function () {
+          followers.forEach(function (video) {
+            video.pause();
+          });
+        });
+        leader.addEventListener("seeked", function () {
+          followers.forEach(function (video) {
+            video.currentTime = leader.currentTime;
+          });
+        });
+      }
+
+      function initSplitComparison() {
+        var wrappers = Array.prototype.slice.call(document.querySelectorAll(".dual-comparison-wrapper[data-slider]"));
+        wrappers.forEach(function (wrapper) {
+          var split = 0.5;
+          var isDragging = false;
+          var handle = wrapper.querySelector(".slider-handle");
+          var card = wrapper.closest(".split-comparison-card");
+          var tabs = card ? Array.prototype.slice.call(card.querySelectorAll(".comparison-scene-tab")) : [];
+          var oursVideo = wrapper.querySelector(".video-ours");
+          var baselineVideo = wrapper.querySelector(".video-baseline");
+          var videos = Array.prototype.slice.call(wrapper.querySelectorAll(".comparison-video"));
+
+          function clamp(value, min, max) {
+            return Math.max(min, Math.min(max, value));
+          }
+
+          function updateSplit() {
+            wrapper.style.setProperty("--split-position", (split * 100).toFixed(2) + "%");
+          }
+
+          function positionFromEvent(event) {
+            var bounds = wrapper.getBoundingClientRect();
+            var width = bounds.width || 1;
+            return clamp((event.clientX - bounds.left) / width, 0, 1);
+          }
+
+          function updateFromPointer(event) {
+            var position = positionFromEvent(event);
+            split = clamp(position, 0.08, 0.92);
+            updateSplit();
+          }
+
+          if (handle) {
+            handle.addEventListener("pointerdown", function (event) {
+              isDragging = true;
+              handle.setPointerCapture(event.pointerId);
+              updateFromPointer(event);
+              event.preventDefault();
+            });
+          }
+
+          wrapper.addEventListener("pointerdown", function (event) {
+            if (event.target && event.target.classList.contains("slider-handle")) {
+              return;
+            }
+            isDragging = true;
+            updateFromPointer(event);
+            event.preventDefault();
+          });
+
+          window.addEventListener("pointermove", function (event) {
+            if (!isDragging) {
+              return;
+            }
+            updateFromPointer(event);
+          });
+
+          window.addEventListener("pointerup", function () {
+            isDragging = false;
+          });
+
+          function loadComparisonVideos() {
+            if (videos.length < 2) {
+              return;
+            }
+            loadVideosSync(videos, function () {
+              videos.forEach(function (video) {
+                video.currentTime = 0.1;
+                safePlay(video);
+              });
+            });
+          }
+
+          tabs.forEach(function (tab) {
+            tab.addEventListener("click", function () {
+              if (tab.classList.contains("is-active")) {
+                return;
+              }
+              tabs.forEach(function (item) {
+                item.classList.remove("is-active");
+              });
+              tab.classList.add("is-active");
+              setVideoSource(oursVideo, tab.getAttribute("data-ours"));
+              setVideoSource(baselineVideo, tab.getAttribute("data-baseline"));
+              videos.forEach(function (video) {
+                video.load();
+              });
+              loadComparisonVideos();
+            });
+          });
+
+          if (videos.length > 1) {
+            loadComparisonVideos();
+            syncFollowerVideos(videos[0], videos.slice(1));
+            window.setInterval(function () {
+              var leader = videos[0];
+              if (!leader || leader.paused) {
+                return;
+              }
+              videos.slice(1).forEach(function (video) {
+                if (Math.abs(video.currentTime - leader.currentTime) > 0.12) {
+                  video.currentTime = leader.currentTime;
+                }
+              });
+            }, 700);
+          }
+
+          updateSplit();
+        });
+      }
+
+      function initZoomFeature(section, videos, scrubber) {
+        var videoBoxes = Array.prototype.slice.call(section.querySelectorAll(".video-box"));
+        var videoContainer = section.querySelector(".baseline-video-container");
+        if (!videoBoxes.length || !videoContainer) {
+          return null;
+        }
+
+        var rectIndicators = [];
+        var overlays = [];
+
+        videoBoxes.forEach(function (box, i) {
+          var vid = videos[i];
+          if (!vid) {
+            return;
+          }
+
+          var inner = document.createElement("div");
+          inner.className = "video-inner-wrap";
+          box.insertBefore(inner, vid);
+          inner.appendChild(vid);
+
+          var indicator = document.createElement("div");
+          indicator.className = "zoom-rect-indicator";
+          inner.appendChild(indicator);
+          rectIndicators.push(indicator);
+
+          var overlay = document.createElement("div");
+          overlay.className = "video-draw-overlay";
+          inner.appendChild(overlay);
+          overlays.push(overlay);
+        });
+
+        var hint = document.createElement("p");
+        hint.className = "zoom-drag-hint";
+        hint.textContent = "Drag on any video to zoom in";
+        videoContainer.parentNode.insertBefore(hint, videoContainer.nextSibling);
+
+        var zoomWrap = document.createElement("div");
+        zoomWrap.className = "zoom-panels-wrap";
+        zoomWrap.style.display = "none";
+
+        var zoomHeader = document.createElement("div");
+        zoomHeader.className = "zoom-panels-header";
+        var zoomTitle = document.createElement("span");
+        zoomTitle.className = "zoom-panels-title";
+        zoomTitle.textContent = "Zoomed Region";
+        var closeBtn = document.createElement("button");
+        closeBtn.className = "zoom-close-btn";
+        closeBtn.innerHTML = "&#x2715;";
+        closeBtn.title = "Close";
+        zoomHeader.appendChild(zoomTitle);
+        zoomHeader.appendChild(closeBtn);
+        zoomWrap.appendChild(zoomHeader);
+
+        var zoomRow = document.createElement("div");
+        zoomRow.className = "zoom-panels-row";
+        zoomWrap.appendChild(zoomRow);
+
+        var zoomCanvases = [];
+        videoBoxes.forEach(function (box) {
+          var panel = document.createElement("div");
+          panel.className = "zoom-panel";
+          var canvas = document.createElement("canvas");
+          panel.appendChild(canvas);
+          zoomCanvases.push(canvas);
+          var sourceLabel = box.querySelector(".video-label");
+          var label = document.createElement("p");
+          label.className = sourceLabel ? sourceLabel.className : "video-label";
+          label.textContent = sourceLabel ? sourceLabel.textContent : "";
+          panel.appendChild(label);
+          zoomRow.appendChild(panel);
+        });
+
+        videoContainer.parentNode.insertBefore(zoomWrap, videoContainer);
+
+        var normRect = { x: 0.72, y: 0, w: 0.28, h: 0.28 };
+
+        closeBtn.addEventListener("click", function () {
+          zoomWrap.style.display = "none";
+          rectIndicators.forEach(function (rect) {
+            rect.style.display = "none";
+          });
+          normRect = { x: 0.72, y: 0, w: 0.28, h: 0.28 };
+          hint.style.display = "";
+        });
+
+        function showRects(rect) {
+          rectIndicators.forEach(function (indicator, i) {
+            var video = videos[i];
+            if (!video) {
+              return;
+            }
+            var width = video.offsetWidth || 1;
+            var height = video.offsetHeight || 1;
+            indicator.style.display = "block";
+            indicator.style.left = (rect.x * width) + "px";
+            indicator.style.top = (rect.y * height) + "px";
+            indicator.style.width = (rect.w * width) + "px";
+            indicator.style.height = (rect.h * height) + "px";
+          });
+        }
+
+        function drawZoom(rect) {
+          if (!rect || rect.w < 0.015 || rect.h < 0.015) {
+            return;
+          }
+          zoomWrap.style.display = "block";
+          hint.style.display = "none";
+
+          var rowWidth = zoomRow.offsetWidth;
+          if (rowWidth < 10) {
+            var sampleVideo = videos[0];
+            rowWidth = sampleVideo ? (sampleVideo.offsetWidth * videos.length + 12 * (videos.length - 1)) : 600;
+          }
+          var panelWidth = Math.max(100, Math.floor((rowWidth - (videos.length - 1) * 12) / videos.length));
+
+          videos.forEach(function (video, i) {
+            var canvas = zoomCanvases[i];
+            if (!canvas) {
+              return;
+            }
+            var videoWidth = video.videoWidth;
+            var videoHeight = video.videoHeight;
+            if (!videoWidth || !videoHeight) {
+              return;
+            }
+
+            var panelHeight = Math.round(panelWidth * (rect.h * videoHeight) / (rect.w * videoWidth));
+            canvas.width = panelWidth;
+            canvas.height = panelHeight;
+
+            try {
+              var context = canvas.getContext("2d");
+              context.clearRect(0, 0, panelWidth, panelHeight);
+              context.drawImage(
+                video,
+                rect.x * videoWidth,
+                rect.y * videoHeight,
+                rect.w * videoWidth,
+                rect.h * videoHeight,
+                0,
+                0,
+                panelWidth,
+                panelHeight
+              );
+            } catch (error) {}
+          });
+        }
+
+        overlays.forEach(function (overlay) {
+          var moving = false;
+          var drawing = false;
+          var startX = 0;
+          var startY = 0;
+          var startRectX = 0;
+          var startRectY = 0;
+          var frame = null;
+
+          function hitTest(x, y, bounds) {
+            var width = bounds.width || 1;
+            var height = bounds.height || 1;
+            return x >= normRect.x * width &&
+              x <= (normRect.x + normRect.w) * width &&
+              y >= normRect.y * height &&
+              y <= (normRect.y + normRect.h) * height;
+          }
+
+          overlay.addEventListener("mousedown", function (event) {
+            var bounds = overlay.getBoundingClientRect();
+            var x = event.clientX - bounds.left;
+            var y = event.clientY - bounds.top;
+            if (hitTest(x, y, bounds)) {
+              moving = true;
+              startX = x;
+              startY = y;
+              startRectX = normRect.x;
+              startRectY = normRect.y;
+              overlay.style.cursor = "grabbing";
+            } else {
+              drawing = true;
+              startX = x;
+              startY = y;
+              overlay.style.cursor = "crosshair";
+            }
+            event.preventDefault();
+          });
+
+          document.addEventListener("mousemove", function (event) {
+            var bounds = overlay.getBoundingClientRect();
+            var width = bounds.width || 1;
+            var height = bounds.height || 1;
+
+            if (moving) {
+              var dx = (event.clientX - bounds.left - startX) / width;
+              var dy = (event.clientY - bounds.top - startY) / height;
+              normRect = {
+                x: Math.max(0, Math.min(1 - normRect.w, startRectX + dx)),
+                y: Math.max(0, Math.min(1 - normRect.h, startRectY + dy)),
+                w: normRect.w,
+                h: normRect.h
+              };
+              showRects(normRect);
+              if (frame) {
+                cancelAnimationFrame(frame);
+              }
+              frame = requestAnimationFrame(function () {
+                drawZoom(normRect);
+                frame = null;
+              });
+            } else if (drawing) {
+              var currentX = event.clientX - bounds.left;
+              var currentY = event.clientY - bounds.top;
+              var nextRect = {
+                x: Math.max(0, Math.min(1, Math.min(startX, currentX) / width)),
+                y: Math.max(0, Math.min(1, Math.min(startY, currentY) / height)),
+                w: Math.min(1, Math.abs(currentX - startX) / width),
+                h: Math.min(1, Math.abs(currentY - startY) / height)
+              };
+              nextRect.w = Math.min(nextRect.w, 1 - nextRect.x);
+              nextRect.h = Math.min(nextRect.h, 1 - nextRect.y);
+              normRect = nextRect;
+              showRects(normRect);
+            }
+          });
+
+          document.addEventListener("mouseup", function () {
+            if (moving) {
+              moving = false;
+              overlay.style.cursor = "move";
+              drawZoom(normRect);
+            } else if (drawing) {
+              drawing = false;
+              overlay.style.cursor = "crosshair";
+              if (normRect && normRect.w > 0.015 && normRect.h > 0.015) {
+                drawZoom(normRect);
+              }
+            }
+          });
+
+          overlay.addEventListener("mousemove", function (event) {
+            if (moving || drawing) {
+              return;
+            }
+            var bounds = overlay.getBoundingClientRect();
+            var x = event.clientX - bounds.left;
+            var y = event.clientY - bounds.top;
+            overlay.style.cursor = hitTest(x, y, bounds) ? "move" : "crosshair";
+          });
+        });
+
+        if (scrubber) {
+          scrubber.addEventListener("input", function () {
+            requestAnimationFrame(function () {
+              drawZoom(normRect);
+            });
+          });
+        }
+
+        showRects(normRect);
+
+        return function onVideosReady() {
+          showRects(normRect);
+          window.setTimeout(function () {
+            drawZoom(normRect);
+          }, 80);
+        };
+      }
+
+      function initMethodComparison() {
+        var section = document.getElementById("matrixcity-baseline-demo");
+        if (!section) {
+          return;
+        }
+
+        var scenes = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+        var labels = {
+          vanilla_3dgs: "Vanilla 3DGS",
+          clm: "CLM",
+          tidegs: "TideGS (ours)"
+        };
+        var state = { scene: "1" };
+        var sceneSelector = document.getElementById("matrixcity-scene-selector");
+        var methodVideos = Array.prototype.slice.call(section.querySelectorAll(".matrixcity-method-video[data-method]"));
+        var scrubber = document.getElementById("matrixcity-scrubber");
+        var leaderVideo = methodVideos[0] || null;
+        var onZoomReady = null;
+
+        function resetScrubber() {
+          var startTime = 0.1;
+          var duration = leaderVideo && isFinite(leaderVideo.duration) ? leaderVideo.duration : 0;
+          var startValue = duration > 0 ? Math.round(startTime / duration * 1000) : 0;
+          methodVideos.forEach(function (video) {
+            video.currentTime = startTime;
+          });
+          if (scrubber) {
+            scrubber.value = startValue;
+          }
+        }
+
+        function updateVideos() {
+          methodVideos.forEach(function (video) {
+            var method = String(video.getAttribute("data-method") || "");
+            setVideoSource(video, "./static/videos/matrixcity_video_slice/" + method + "/" + state.scene + ".mp4");
+            var label = video.parentElement ? video.parentElement.querySelector(".video-label") : null;
+            if (label && labels[method]) {
+              label.textContent = labels[method];
+            }
+          });
+
+          loadVideosSync(methodVideos, function () {
+            methodVideos.forEach(function (video) {
+              video.pause();
+            });
+            resetScrubber();
+            if (onZoomReady) {
+              onZoomReady();
+            }
+          });
+        }
+
+        function renderSceneButtons() {
+          sceneSelector.innerHTML = "";
+          scenes.forEach(function (scene) {
+            var button = document.createElement("div");
+            button.className = "scene-circle" + (scene === state.scene ? " active" : "");
+            button.innerHTML = "<span>" + scene + "</span>";
+            button.addEventListener("click", function () {
+              state.scene = scene;
+              renderSceneButtons();
+              updateVideos();
+            });
+            sceneSelector.appendChild(button);
+          });
+        }
+
+        if (scrubber) {
+          scrubber.addEventListener("input", function () {
+            if (!leaderVideo) {
+              return;
+            }
+            var duration = isFinite(leaderVideo.duration) ? leaderVideo.duration : 0;
+            var time = (parseInt(scrubber.value, 10) / 1000) * duration;
+            methodVideos.forEach(function (video) {
+              video.currentTime = time;
+            });
+          });
+        }
+
+        renderSceneButtons();
+        if (methodVideos.length > 1) {
+          syncFollowerVideos(methodVideos[0], methodVideos.slice(1));
+        }
+        onZoomReady = initZoomFeature(section, methodVideos, scrubber);
+        updateVideos();
+      }
+
+      function initToc() {
+        var toc = document.querySelector(".toc");
+        var tocLinks = Array.prototype.slice.call(document.querySelectorAll(".toc a"));
+        var sections = tocLinks.map(function (link) {
+          return document.querySelector(link.getAttribute("href"));
+        }).filter(Boolean);
+
+        function updateToc() {
+          if (!toc || !sections.length) {
+            return;
+          }
+          var current = sections.reduce(function (active, section) {
+            var rect = section.getBoundingClientRect();
+            return rect.top <= 140 ? section : active;
+          }, sections[0]);
+          tocLinks.forEach(function (link) {
+            link.classList.toggle("active", link.getAttribute("href") === "#" + current.id);
+          });
+          toc.classList.toggle("show", window.scrollY > window.innerHeight * 0.45);
+        }
+
+        updateToc();
+        window.addEventListener("scroll", updateToc, { passive: true });
+      }
+
+      document.addEventListener("DOMContentLoaded", function () {
+        initCityGallery();
+        initSplitComparison();
+        initMethodComparison();
+        initToc();
+      });
+    })();
+  </script>
+</body>
+
+</html>
