@@ -173,12 +173,45 @@ canvas {
 }
 
 .publication-venue {
-  margin: 0 0 1rem;
+  margin: 0 0 0.15rem;
   color: #333;
   font-family: 'Google Sans', sans-serif;
   font-size: 1.22rem;
   font-weight: 600;
   text-align: center !important;
+}
+
+/* Publication note styles for awards and special recognition */
+.publication-note {
+  display: inline-block;
+  background: linear-gradient(135deg, #28a745, #34ce57);
+  color: white;
+  font-family: Arial, sans-serif;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 12px;
+  margin: 0.3rem 0 0.5rem 0;
+  box-shadow: 0 2px 8px rgba(40, 167, 69, 0.3);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  animation: subtle-glow 2s ease-in-out infinite alternate;
+}
+
+/* Subtle glow animation for special notes */
+@keyframes subtle-glow {
+  0% {
+    box-shadow: 0 2px 8px rgba(40, 167, 69, 0.3);
+  }
+  100% {
+    box-shadow: 0 2px 12px rgba(40, 167, 69, 0.5);
+  }
+}
+
+.publication-note.spotlight {
+  background: linear-gradient(135deg, #e74c3c, #f39c12);
+  color: white;
+  box-shadow: 0 2px 8px rgba(231, 76, 60, 0.4);
 }
 
 .publication-authors {
