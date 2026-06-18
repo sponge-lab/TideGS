@@ -144,6 +144,8 @@ class TieredCacheManager:
             'inflight_fallback_blocks': 0,
             'ssd_bytes_read_urgent': 0,
             'ssd_bytes_read_future': 0,
+            'ssd_bytes_written_async': 0,
+            'ssd_bytes_written_sync': 0,
         }
 
         # Start async worker threads
@@ -294,6 +296,10 @@ class TieredCacheManager:
             return
 
         block_versions = block_versions or {}
+        bytes_written = sum(
+            t.numel() * t.element_size() if torch.is_tensor(t) else self.bytes_per_block
+            for t in dirty_blocks.values()
+        )
         t0 = time.time()
         try:
             self.storage.write_patch(dirty_blocks)
@@ -323,10 +329,12 @@ class TieredCacheManager:
                 self.stats['async_flush_jobs'] += 1
                 self.stats['async_flush_blocks'] += len(dirty_blocks)
                 self.stats['async_flush_time'] += elapsed
+                self.stats['ssd_bytes_written_async'] += bytes_written
             else:
                 self.stats['sync_flush_jobs'] += 1
                 self.stats['sync_flush_blocks'] += len(dirty_blocks)
                 self.stats['sync_flush_time'] += elapsed
+                self.stats['ssd_bytes_written_sync'] += bytes_written
         except Exception as e:
             print(f"[TieredCache] ERROR during SSD write: {e}")
             with self.cache_lock:

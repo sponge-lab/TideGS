@@ -740,6 +740,9 @@ def snapshot_paper_warm_layer_metrics(storage_adapter) -> Optional[Dict[str, flo
             "max_ram_mb": float(cache_stats.get("max_ram_mb", 0.0)),
             "ssd_bytes_read_urgent": int(cache_stats.get("ssd_bytes_read_urgent", 0)),
             "ssd_bytes_read_future": int(cache_stats.get("ssd_bytes_read_future", 0)),
+            "ssd_bytes_written_async": int(cache_stats.get("ssd_bytes_written_async", 0)),
+            "ssd_bytes_written_sync": int(cache_stats.get("ssd_bytes_written_sync", 0)),
+            "async_flush_jobs": int(cache_stats.get("async_flush_jobs", 0)),
         })
 
     return metrics
@@ -1384,12 +1387,24 @@ def _calc_stage_time_ms(perf_times: Dict[str, float], start: str, end: str) -> f
     return (perf_times.get(end, iter_start) - perf_times.get(start, iter_start)) * 1000.0
 
 
+# Per-session snapshot for computing flush deltas between stage-detail log lines.
+_prev_flush_snapshot: Dict[str, int] = {
+    'async_flush_jobs': 0,
+    'async_flush_blocks': 0,
+    'sync_flush_jobs': 0,
+    'sync_flush_blocks': 0,
+    'ssd_bytes_written_async': 0,
+    'ssd_bytes_written_sync': 0,
+}
+
+
 def log_paper_stage_detail(
     *,
     iteration: int,
     perf_times: Dict[str, float],
     stage_metrics: Dict[str, Any],
     log_file,
+    storage_adapter=None,
 ) -> None:
     """Print fine-grained sub-stage timings and data volumes for Stage 1.5.
 
@@ -1476,7 +1491,7 @@ def log_paper_stage_detail(
         f"resident={resident}  streamed={streamed}  evicted={evicted}"
     )
 
-    # ---- Separator & SSD byte summaries ----
+    # ---- Separator & totals ----
     lines.append("  " + "─" * 72)
 
     # Total Stage 1.5 breakdown vs coarse timer
@@ -1484,6 +1499,45 @@ def log_paper_stage_detail(
         f"  stage1_5_total (detail): {_dt('stage1_5a_cull_done','stage1_5g_prefetch_launch_done'):.0f}ms  "
         f"(coarse ssd_cull+load={_dt('stage1_setup_done','stage1_5_ssd_done'):.0f}ms)"
     )
+
+    # ---- Dirty flush delta (SSD writes since last detail log) ----
+    global _prev_flush_snapshot
+    if storage_adapter is not None:
+        cache = getattr(storage_adapter, "cache", None)
+        if cache is not None:
+            stats = cache.get_stats()
+            cur_async_jobs = int(stats.get('async_flush_jobs', 0))
+            cur_async_blks = int(stats.get('async_flush_blocks', 0))
+            cur_sync_jobs = int(stats.get('sync_flush_jobs', 0))
+            cur_sync_blks = int(stats.get('sync_flush_blocks', 0))
+            cur_async_bytes = int(stats.get('ssd_bytes_written_async', 0))
+            cur_sync_bytes = int(stats.get('ssd_bytes_written_sync', 0))
+
+            d_async_jobs = cur_async_jobs - _prev_flush_snapshot['async_flush_jobs']
+            d_async_blks = cur_async_blks - _prev_flush_snapshot['async_flush_blocks']
+            d_sync_jobs = cur_sync_jobs - _prev_flush_snapshot['sync_flush_jobs']
+            d_sync_blks = cur_sync_blks - _prev_flush_snapshot['sync_flush_blocks']
+            d_async_mb = (cur_async_bytes - _prev_flush_snapshot['ssd_bytes_written_async']) / (1024 * 1024)
+            d_sync_mb = (cur_sync_bytes - _prev_flush_snapshot['ssd_bytes_written_sync']) / (1024 * 1024)
+
+            if d_async_jobs or d_sync_jobs:
+                parts = []
+                if d_async_jobs:
+                    parts.append(f"async={d_async_jobs}jobs/{d_async_blks}blk/{d_async_mb:.1f}MB")
+                if d_sync_jobs:
+                    parts.append(f"sync={d_sync_jobs}jobs/{d_sync_blks}blk/{d_sync_mb:.1f}MB")
+                flushing_now = int(stats.get('flushing_blocks', 0))
+                flush_q = int(stats.get('flush_queue_size', 0))
+                parts.append(f"flushing_now={flushing_now}blk  flush_q={flush_q}")
+                lines.append("  dirty_flush (delta): " + "  ".join(parts))
+
+            # Update snapshot
+            _prev_flush_snapshot['async_flush_jobs'] = cur_async_jobs
+            _prev_flush_snapshot['async_flush_blocks'] = cur_async_blks
+            _prev_flush_snapshot['sync_flush_jobs'] = cur_sync_jobs
+            _prev_flush_snapshot['sync_flush_blocks'] = cur_sync_blks
+            _prev_flush_snapshot['ssd_bytes_written_async'] = cur_async_bytes
+            _prev_flush_snapshot['ssd_bytes_written_sync'] = cur_sync_bytes
 
     msg = "\n".join(lines) + "\n"
     log_file.write(msg)
@@ -1524,6 +1578,7 @@ def log_paper_perf_profile(
             perf_times=perf_times,
             stage_metrics=paper_stage_metrics,
             log_file=log_file,
+            storage_adapter=storage_adapter,
         )
 
 
