@@ -142,6 +142,8 @@ class TieredCacheManager:
             'inflight_wait_blocks': 0,
             'inflight_wait_time': 0.0,
             'inflight_fallback_blocks': 0,
+            'ssd_bytes_read_urgent': 0,
+            'ssd_bytes_read_future': 0,
         }
 
         # Start async worker threads
@@ -392,6 +394,12 @@ class TieredCacheManager:
 
                 if to_load:
                     loaded = self.storage.read_blocks(to_load)
+                    if loaded:
+                        loaded_bytes = sum(
+                            t.numel() * t.element_size() if torch.is_tensor(t) else self.bytes_per_block
+                            for t in loaded.values()
+                        )
+                        self.stats['ssd_bytes_read_future'] += loaded_bytes
                     with self.cache_lock:
                         for block_id, tensor in loaded.items():
                             with self.flushing_lock:
@@ -640,6 +648,7 @@ class TieredCacheManager:
         self.stats['urgent_prefetch_blocks'] += actual_reads
         self.stats['urgent_prefetch_miss_blocks'] += actual_reads
         self.stats['urgent_prefetch_time'] += read_time
+        self.stats['ssd_bytes_read_urgent'] += actual_reads * self.bytes_per_block
 
         # Update stats
         self.stats['cache_hits'] += len(cache_hits)

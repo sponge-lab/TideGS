@@ -912,6 +912,7 @@ def clm_offload_train_one_batch(
     # ========================================================================
     import time as _time
     _perf_t = {}
+    _paper_stage_metrics = {}  # accumulates data volume counters for detailed stage logging
     # iterations step by bsz (1, 65, 129, ...), so "% 50 == 1" only fires once
     # use a counter that increments per batch instead
     if not hasattr(clm_offload_train_one_batch, '_batch_count'):
@@ -1020,7 +1021,9 @@ def clm_offload_train_one_batch(
             cam_to_blocks[cam_global_idx] = len(blocks)
 
         visible_block_ids = sorted(list(visible_block_ids_set))
-        
+        _paper_stage_metrics['visible_block_ids'] = len(visible_block_ids)
+        _paper_stage_metrics['num_cameras'] = len(batched_cameras)
+
         _log_paper_block_visibility_debug(
             enabled=paper_debug_logging,
             iteration=iteration,
@@ -1070,6 +1073,10 @@ def clm_offload_train_one_batch(
             log_file.write(
                 f"[SSD] Iter {iteration}: {len(visible_block_ids)}/{total_blocks} blocks visible ({vis_ratio:.1f}%)\n"
             )
+        total_blocks = storage_adapter.culler.num_blocks
+        _paper_stage_metrics['total_blocks'] = total_blocks
+        _paper_stage_metrics['visible_ratio_pct'] = 100.0 * len(visible_block_ids) / total_blocks if total_blocks > 0 else 0.0
+        _ts('stage1_5a_cull_done')
 
         paper_block_sets = None
         paper_ab_buffer_source = None
@@ -1228,6 +1235,8 @@ def clm_offload_train_one_batch(
                         get_double_buffer_gpu_fn=get_double_buffer_gpu,
                         ensure_local_to_global_mapping_fn=ensure_local_to_global_mapping,
                         resolve_current_iteration_resident_blocks_fn=_resolve_current_iteration_resident_blocks,
+                        perf_t=_perf_t,
+                        paper_stage_metrics=_paper_stage_metrics,
                         log_file=log_file,
                     )
                 else:
@@ -1257,6 +1266,10 @@ def clm_offload_train_one_batch(
                 gaussians.gpu_working_set_manager.gpu_opacity = gaussians._opacity
                 gaussians.gpu_working_set_manager.gpu_features_dc = gaussians._features_dc
                 gaussians.gpu_working_set_manager.gpu_features_rest = gaussians._features_rest
+                # For non-paper path, timestamp SSD→GPU load completion
+                if not is_paper_ssd_mode:
+                    _ts('stage1_5b_ab_check_done')
+                    _ts('stage1_5d_ssd_load_done')
 
                 if is_paper_ssd_mode:
                     double_buffer = get_double_buffer_gpu(
@@ -1294,6 +1307,13 @@ def clm_offload_train_one_batch(
                         paper_block_sets.get('updated_recency_scores', {})
                     )
                     stream_in_for_next = list(paper_block_sets.get('stream_in_blocks', []))
+                    evict_blocks = list(paper_block_sets.get('evict_blocks', []))
+                    _paper_stage_metrics['delta_plus'] = len(stream_in_for_next)
+                    _paper_stage_metrics['delta_minus'] = len(evict_blocks)
+                    _paper_stage_metrics['r_t_next_size'] = len(paper_block_sets.get('next_resident_blocks', []))
+                    _paper_stage_metrics['k_t_next_size'] = len(paper_block_sets.get('next_active_blocks', []))
+                    _ts('stage1_5e_delta_done')
+
                     active_block_reader = getattr(gaussians, '_block_reader', None)
                     if active_block_reader is not None and stream_in_for_next:
                         paper_delta_future_submitted_early = int(active_block_reader.hint_future(stream_in_for_next) or 0)
@@ -1305,6 +1325,10 @@ def clm_offload_train_one_batch(
                                 requested=len(stream_in_for_next),
                                 log_file=log_file,
                             )
+                    _paper_stage_metrics['hint_submitted'] = int(paper_delta_future_submitted_early) if stream_in_for_next else 0
+                    _paper_stage_metrics['hint_requested'] = len(stream_in_for_next)
+                    _ts('stage1_5f_hint_done')
+
                     _configure_gpu_resident_optimizer_state(
                         gaussians=gaussians,
                         args=args,
@@ -1313,6 +1337,11 @@ def clm_offload_train_one_batch(
                         get_gpu_resident_optimizer_fn=get_gpu_resident_optimizer,
                         log_file=log_file,
                     )
+                    _paper_stage_metrics['g_current_resident_blocks'] = len(actual_current_resident_blocks)
+                    _paper_stage_metrics['g_stream_in_for_next'] = len(stream_in_for_next)
+                    _paper_stage_metrics['g_evict_blocks'] = len(evict_blocks)
+                    _ts('stage1_5g_prefetch_launch_done')
+
                     if should_log_paper_sets:
                         _log_paper_block_sets(
                             log_file=log_file,
@@ -3210,6 +3239,8 @@ def clm_offload_train_one_batch(
                 perf_times=_perf_t,
                 log_file=log_file,
                 storage_adapter=storage_adapter,
+                paper_stage_metrics=_paper_stage_metrics,
+                paper_debug_logging=paper_debug_logging,
             )
         else:
             def _dt(a, b):

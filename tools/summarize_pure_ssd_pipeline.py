@@ -49,6 +49,17 @@ FIELDS = [
     "future_prefetch_jobs",
     "future_prefetch_blocks",
     "future_prefetch_time_s",
+    "stage1_5a_cull_time_s",
+    "stage1_5b_ab_check_time_s",
+    "stage1_5c_resident_time_s",
+    "stage1_5d_ssd_load_time_s",
+    "stage1_5e_delta_time_s",
+    "stage1_5f_hint_time_s",
+    "stage1_5g_ab_prefetch_time_s",
+    "ssd_bytes_read_urgent_gb",
+    "ssd_bytes_read_future_gb",
+    "ab_prefetch_hit_count",
+    "ab_prefetch_miss_count",
     "dirty_blocks_before_shutdown",
     "dirty_blocks_after_shutdown",
     "sync_flush_blocks",
@@ -117,6 +128,15 @@ PATTERNS = {
     "kt_metrics": re.compile(r"\[PAPER K_T METRICS\].*"),
     "end2end": re.compile(r"end2end total_time: ([0-9.]+) s, iterations: (\d+), throughput ([0-9.]+) it/s"),
     "kv": re.compile(r"([A-Za-z_]+)=([0-9.]+)"),
+    "stage_detail_time": re.compile(
+        r"stage\d\w+\s+:\s+([0-9.]+)ms"
+    ),
+    "stage_detail_hit": re.compile(
+        r"stage1_5b_ab_check\s+:\s+[0-9.]+ms\s+HIT"
+    ),
+    "stage_detail_miss": re.compile(
+        r"stage1_5b_ab_check\s+:\s+[0-9.]+ms\s+MISS"
+    ),
 }
 
 
@@ -379,6 +399,46 @@ def summarize_log(log_path: Path) -> Dict[str, object]:
                     summary["future_prefetch_blocks"] = values["future_blocks"]
                 if "future_time" in values:
                     summary["future_prefetch_time_s"] = float(values["future_time"]) / 1000.0
+                if "ssd_urgent_mb" in values:
+                    summary["ssd_bytes_read_urgent_gb"] = _as_gb_mb(values["ssd_urgent_mb"])
+                if "ssd_future_mb" in values:
+                    summary["ssd_bytes_read_future_gb"] = _as_gb_mb(values["ssd_future_mb"])
+            elif "[PAPER STAGE DETAIL]" in line:
+                # Parse multi-line stage detail block — each sub-line starts with "  stage"
+                # We accumulate the LAST value for each stage (final state of counters)
+                pass  # handled by the line-by-line parsing below
+            elif line.startswith("  stage1_5a_cull"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5a_cull_time_s"] = float(summary["stage1_5a_cull_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5b_ab_check"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5b_ab_check_time_s"] = float(summary["stage1_5b_ab_check_time_s"] or 0) + float(m.group(1)) / 1000.0
+                if PATTERNS["stage_detail_hit"].search(line):
+                    summary["ab_prefetch_hit_count"] = int(summary["ab_prefetch_hit_count"] or 0) + 1
+                elif PATTERNS["stage_detail_miss"].search(line):
+                    summary["ab_prefetch_miss_count"] = int(summary["ab_prefetch_miss_count"] or 0) + 1
+            elif line.startswith("  stage1_5c_resident") and "(skipped" not in line:
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5c_resident_time_s"] = float(summary["stage1_5c_resident_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5d_ssd_load") and "(skipped" not in line:
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5d_ssd_load_time_s"] = float(summary["stage1_5d_ssd_load_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5e_delta"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5e_delta_time_s"] = float(summary["stage1_5e_delta_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5f_hint"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5f_hint_time_s"] = float(summary["stage1_5f_hint_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5g_ab_prefetch"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5g_ab_prefetch_time_s"] = float(summary["stage1_5g_ab_prefetch_time_s"] or 0) + float(m.group(1)) / 1000.0
             elif "[LogStorage] Created patch" in line:
                 match = PATTERNS["patch"].search(line)
                 if match:

@@ -738,6 +738,8 @@ def snapshot_paper_warm_layer_metrics(storage_adapter) -> Optional[Dict[str, flo
             "cache_future_pending": int(cache_stats.get("future_prefetch_pending", cache_stats.get("future_pending_blocks", 0))),
             "ram_usage_mb": float(cache_stats.get("ram_usage_mb", 0.0)),
             "max_ram_mb": float(cache_stats.get("max_ram_mb", 0.0)),
+            "ssd_bytes_read_urgent": int(cache_stats.get("ssd_bytes_read_urgent", 0)),
+            "ssd_bytes_read_future": int(cache_stats.get("ssd_bytes_read_future", 0)),
         })
 
     return metrics
@@ -799,7 +801,9 @@ def log_paper_warm_layer_metrics(storage_adapter, iteration: int, stage: str, lo
         f"future_time={metrics.get('cache_future_prefetch_time_ms', 0.0):.1f}ms "
         f"future_q={metrics.get('cache_future_queue', 0)} "
         f"future_pending={metrics.get('cache_future_pending', 0)} "
-        f"future_errors={metrics.get('cache_future_prefetch_errors', 0)}\n",
+        f"future_errors={metrics.get('cache_future_prefetch_errors', 0)} "
+        f"ssd_urgent_mb={metrics.get('ssd_bytes_read_urgent', 0) / (1024*1024):.1f} "
+        f"ssd_future_mb={metrics.get('ssd_bytes_read_future', 0) / (1024*1024):.1f}\n",
         log_file=log_file,
     )
 
@@ -1374,12 +1378,126 @@ def collect_paper_updated_block_ids(
     )
 
 
+def _calc_stage_time_ms(perf_times: Dict[str, float], start: str, end: str) -> float:
+    """Compute elapsed ms between two _ts() timestamps."""
+    iter_start = perf_times.get("iter_start", 0.0)
+    return (perf_times.get(end, iter_start) - perf_times.get(start, iter_start)) * 1000.0
+
+
+def log_paper_stage_detail(
+    *,
+    iteration: int,
+    perf_times: Dict[str, float],
+    stage_metrics: Dict[str, Any],
+    log_file,
+) -> None:
+    """Print fine-grained sub-stage timings and data volumes for Stage 1.5.
+
+    Called from log_paper_perf_profile every _perf_log interval when
+    paper_debug_logging is enabled.
+    """
+    _dt = lambda s, e: _calc_stage_time_ms(perf_times, s, e)
+
+    ab_hit = stage_metrics.get('ab_buffer_hit', False)
+    ab_src = stage_metrics.get('ab_buffer_source', 'n/a')
+
+    lines = [f"[PAPER STAGE DETAIL] Iter {iteration}:"]
+
+    # ---- 1.5a: Block-level culling (incl. Stage 0 schedule interaction) ----
+    lines.append(
+        f"  stage1_5a_cull        : {_dt('iter_start','stage1_5a_cull_done'):8.1f}ms  "
+        f"|K_t|={stage_metrics.get('visible_block_ids','?'):>5}  "
+        f"vis={stage_metrics.get('visible_ratio_pct', 0.0):.1f}%"
+    )
+
+    # ---- 1.5b: A/B Buffer Check ----
+    if ab_hit:
+        lines.append(
+            f"  stage1_5b_ab_check    : {_dt('stage1_5a_cull_done','stage1_5b_ab_check_done'):8.1f}ms  "
+            f"HIT  src={ab_src}"
+        )
+    else:
+        hit_or_miss = "HIT" if ab_hit else "MISS"
+        miss_reason = stage_metrics.get('prefetch_miss_reason', 'n/a')
+        lines.append(
+            f"  stage1_5b_ab_check    : {_dt('stage1_5a_cull_done','stage1_5b_ab_check_done'):8.1f}ms  "
+            f"MISS  reason={miss_reason}"
+        )
+
+    # ---- 1.5c: Resident Set Resolution ----
+    if ab_hit:
+        lines.append(f"  stage1_5c_resident    : {'(skipped — AB buffer hit)':>40}")
+    else:
+        rt = stage_metrics.get('r_t_size', '?')
+        rt_ur = stage_metrics.get('r_t_size_unrestricted', rt)
+        kt = stage_metrics.get('k_t_size', '?')
+        cap = stage_metrics.get('resident_capacity', '?')
+        policy = stage_metrics.get('resident_policy', '?')
+        lines.append(
+            f"  stage1_5c_resident    : {_dt('stage1_5b_ab_check_done','stage1_5c_resident_done'):8.1f}ms  "
+            f"|R_t|={rt}(/{rt_ur} unrestrict)  |K_t|={kt}  cap={cap}  policy={policy}"
+        )
+
+    # ---- 1.5d: SSD→RAM→GPU Load ----
+    if ab_hit:
+        lines.append(f"  stage1_5d_ssd_load    : {'(skipped — AB buffer hit)':>40}")
+    else:
+        sync_src = stage_metrics.get('sync_load_source', 'sync_ram_to_gpu')
+        sync_vis = stage_metrics.get('sync_visible_block_ids', '?')
+        lines.append(
+            f"  stage1_5d_ssd_load    : {_dt('stage1_5c_resident_done','stage1_5d_ssd_load_done'):8.1f}ms  "
+            f"loaded={sync_vis}  src={sync_src}"
+        )
+
+    # ---- 1.5e: Delta Calculation ----
+    delta_plus = stage_metrics.get('delta_plus', 0)
+    delta_minus = stage_metrics.get('delta_minus', 0)
+    rt_next = stage_metrics.get('r_t_next_size', '?')
+    kt_next = stage_metrics.get('k_t_next_size', '?')
+    lines.append(
+        f"  stage1_5e_delta       : {_dt('stage1_5d_ssd_load_done','stage1_5e_delta_done'):8.1f}ms  "
+        f"|K_t+1|={kt_next}  Δ+={delta_plus}  Δ-={delta_minus}  |R_t+1|={rt_next}"
+    )
+
+    # ---- 1.5f: Early Delta+ Hint ----
+    submitted = stage_metrics.get('hint_submitted', 0)
+    requested = stage_metrics.get('hint_requested', 0)
+    lines.append(
+        f"  stage1_5f_hint        : {_dt('stage1_5e_delta_done','stage1_5f_hint_done'):8.1f}ms  "
+        f"submitted={submitted}/{requested}"
+    )
+
+    # ---- 1.5g: Async A/B Prefetch Launch ----
+    resident = stage_metrics.get('g_current_resident_blocks', '?')
+    streamed = stage_metrics.get('g_stream_in_for_next', 0)
+    evicted = stage_metrics.get('g_evict_blocks', 0)
+    lines.append(
+        f"  stage1_5g_ab_prefetch : {_dt('stage1_5f_hint_done','stage1_5g_prefetch_launch_done'):8.1f}ms  "
+        f"resident={resident}  streamed={streamed}  evicted={evicted}"
+    )
+
+    # ---- Separator & SSD byte summaries ----
+    lines.append("  " + "─" * 72)
+
+    # Total Stage 1.5 breakdown vs coarse timer
+    lines.append(
+        f"  stage1_5_total (detail): {_dt('stage1_5a_cull_done','stage1_5g_prefetch_launch_done'):.0f}ms  "
+        f"(coarse ssd_cull+load={_dt('stage1_setup_done','stage1_5_ssd_done'):.0f}ms)"
+    )
+
+    msg = "\n".join(lines) + "\n"
+    log_file.write(msg)
+    write_paper_phase1_log(msg, log_file=None)
+
+
 def log_paper_perf_profile(
     *,
     iteration: int,
     perf_times: Dict[str, float],
     log_file,
     storage_adapter=None,
+    paper_stage_metrics: Optional[Dict[str, Any]] = None,
+    paper_debug_logging: bool = False,
 ) -> None:
     def _dt(start: str, end: str) -> float:
         iter_start = perf_times["iter_start"]
@@ -1400,6 +1518,13 @@ def log_paper_perf_profile(
     log_file.write(perf_message)
     write_paper_phase1_log(perf_message, log_file=None)
     log_paper_warm_layer_metrics(storage_adapter, iteration, "perf", log_file=log_file)
+    if paper_debug_logging and paper_stage_metrics:
+        log_paper_stage_detail(
+            iteration=iteration,
+            perf_times=perf_times,
+            stage_metrics=paper_stage_metrics,
+            log_file=log_file,
+        )
 
 
 def load_paper_stage1_working_set(
@@ -1419,8 +1544,11 @@ def load_paper_stage1_working_set(
     get_double_buffer_gpu_fn: Callable,
     ensure_local_to_global_mapping_fn: Callable,
     resolve_current_iteration_resident_blocks_fn: Callable,
+    perf_t: Optional[Dict[str, float]] = None,
+    paper_stage_metrics: Optional[Dict[str, Any]] = None,
     log_file=None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], bool, str]:
+    import time as _time
     used_prefetch_buffer = False
     load_source: Optional[str] = None
     gpu_tensors = None
@@ -1450,8 +1578,17 @@ def load_paper_stage1_working_set(
                     log_file=log_file,
                 )
                 log_paper_warm_layer_metrics(storage_adapter, iteration, "load", log_file=log_file)
+        if perf_t is not None:
+            perf_t['stage1_5b_ab_check_done'] = _time.perf_counter()
 
     if used_prefetch_buffer:
+        if perf_t is not None:
+            _now = _time.perf_counter()
+            perf_t.setdefault('stage1_5c_resident_done', _now)
+            perf_t.setdefault('stage1_5d_ssd_load_done', _now)
+        if paper_stage_metrics is not None:
+            paper_stage_metrics['ab_buffer_hit'] = True
+            paper_stage_metrics['ab_buffer_source'] = str(load_source)
         return gpu_tensors, retention_stats, used_prefetch_buffer, str(load_source)
 
     ab_stats = gaussians._paper_ab_runtime_stats
@@ -1469,6 +1606,9 @@ def load_paper_stage1_working_set(
             ab_stats=ab_stats,
             log_file=log_file,
         )
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['ab_buffer_hit'] = False
+        paper_stage_metrics['prefetch_miss_reason'] = miss_reason
 
     sync_visible_block_ids = visible_block_ids
     total_blocks_estimate = (total_n_gaussians + args.gaussian_block_size - 1) // args.gaussian_block_size
@@ -1479,6 +1619,14 @@ def load_paper_stage1_working_set(
         num_total_blocks=int(total_blocks_estimate),
         current_camera_blocks=current_camera_blocks,
     )
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['resident_policy'] = str(getattr(args, "paper_resident_selection_policy", "passthrough_active_set"))
+        paper_stage_metrics['resident_capacity'] = args.paper_resident_capacity_blocks
+        paper_stage_metrics['r_t_size_unrestricted'] = len(r_t_blocks)
+        paper_stage_metrics['k_t_size'] = len(visible_block_ids)
+        paper_stage_metrics['r_t_size_unrestricted'] = len(r_t_blocks)  # may be updated below
+    if perf_t is not None:
+        perf_t['stage1_5c_resident_done'] = _time.perf_counter()
 
     if not use_fast_ram_ssd_path:
         reachable = set(int(b) for b in visible_block_ids)
@@ -1493,6 +1641,9 @@ def load_paper_stage1_working_set(
                 log_file=log_file,
             )
         r_t_blocks = r_t_blocks_restricted
+
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['r_t_size'] = len(r_t_blocks)
 
     policy = str(getattr(args, "paper_resident_selection_policy", "passthrough_active_set")).lower()
     if policy in {"topc", "topc_strict", "topc_balanced"} and r_t_blocks:
@@ -1526,6 +1677,11 @@ def load_paper_stage1_working_set(
         ),
         block_reader=active_block_reader,
     )
+    if perf_t is not None:
+        perf_t['stage1_5d_ssd_load_done'] = _time.perf_counter()
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['sync_load_source'] = str(load_source) if load_source else "sync_ram_to_gpu"
+        paper_stage_metrics['sync_visible_block_ids'] = len(sync_visible_block_ids)
     if load_source is None:
         load_source = "sync_ram_to_gpu"
     return gpu_tensors, retention_stats, used_prefetch_buffer, load_source
