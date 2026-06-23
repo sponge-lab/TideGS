@@ -103,6 +103,11 @@ class TieredCacheManager:
         self.future_pending: Set[int] = set()
         self.future_lock = threading.RLock()
 
+        # Per-block SSD read coordination.  The thread that creates an event
+        # owns the SSD read; all other callers wait and reuse the cached result.
+        self.inflight_reads: Dict[int, threading.Event] = {}
+        self.inflight_lock = threading.RLock()
+
         # Prefetch tracking， 防止重复预取同一个block
         self.prefetch_history: Set[int] = set()
 
@@ -133,6 +138,10 @@ class TieredCacheManager:
             'future_prefetch_blocks': 0,
             'future_prefetch_time': 0.0,
             'future_prefetch_errors': 0,
+            'future_prefetch_reserved': 0,
+            'inflight_wait_blocks': 0,
+            'inflight_wait_time': 0.0,
+            'inflight_fallback_blocks': 0,
         }
 
         # Start async worker threads
@@ -168,6 +177,109 @@ class TieredCacheManager:
     def _log(self, message: str) -> None:
         if self.verbose:
             print(message)
+
+    def _lookup_cached_or_flushing(
+        self,
+        block_id: int,
+        promote_flushing: bool = False,
+    ) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+        """Return a RAM-resident block without touching SSD."""
+        with self.cache_lock:
+            tensor = self.cache_data.get(block_id)
+            if tensor is not None:
+                self.cache_data.move_to_end(block_id)
+                return tensor, 'cache'
+
+        with self.flushing_lock:
+            flushing_entry = self.flushing_buffer.get(block_id)
+
+        if flushing_entry is None:
+            return None, None
+
+        tensor, _, _ = flushing_entry
+        if promote_flushing:
+            with self.cache_lock:
+                cached_tensor = self.cache_data.get(block_id)
+                if cached_tensor is not None:
+                    self.cache_data.move_to_end(block_id)
+                    return cached_tensor, 'cache'
+                self.cache_data[block_id] = tensor
+                self.cache_data.move_to_end(block_id)
+        return tensor, 'flushing'
+
+    def _reserve_inflight_read(self, block_id: int) -> Tuple[threading.Event, bool]:
+        """Reserve the right to read one block from SSD."""
+        with self.inflight_lock:
+            event = self.inflight_reads.get(block_id)
+            if event is not None:
+                return event, False
+
+            event = threading.Event()
+            self.inflight_reads[block_id] = event
+            return event, True
+
+    def _complete_inflight_reads(self, block_ids: List[int]) -> None:
+        """Wake waiters for completed, skipped, or failed SSD reads."""
+        events = []
+        with self.inflight_lock:
+            for block_id in block_ids:
+                event = self.inflight_reads.pop(int(block_id), None)
+                if event is not None:
+                    events.append(event)
+
+        for event in events:
+            event.set()
+
+    def _wait_for_inflight_read(self, event: threading.Event) -> None:
+        t0 = time.time()
+        event.wait()
+        self.stats['inflight_wait_blocks'] += 1
+        self.stats['inflight_wait_time'] += time.time() - t0
+
+    def _read_claimed_blocks(
+        self,
+        block_ids: List[int],
+        result: Dict[int, torch.Tensor],
+        cache_hits: List[int],
+        log_flushing_hit: bool = False,
+    ) -> Tuple[int, float]:
+        """Read caller-owned misses from SSD and publish them to cache."""
+        if not block_ids:
+            return 0, 0.0
+
+        to_read = []
+        resolved_before_read = []
+        for block_id in block_ids:
+            tensor, source = self._lookup_cached_or_flushing(block_id)
+            if tensor is not None:
+                result[block_id] = tensor
+                cache_hits.append(block_id)
+                resolved_before_read.append(block_id)
+                if log_flushing_hit and source == 'flushing':
+                    print(f"[TieredCache] ⚠️ Race avoided: block {block_id} found in flushing_buffer")
+            else:
+                to_read.append(block_id)
+
+        if resolved_before_read:
+            self._complete_inflight_reads(resolved_before_read)
+
+        if not to_read:
+            return 0, 0.0
+
+        t0 = time.time()
+        try:
+            loaded = self.storage.read_blocks(to_read)
+            elapsed = time.time() - t0
+
+            with self.cache_lock:
+                for block_id, tensor in loaded.items():
+                    self.cache_data[block_id] = tensor
+                    self.cache_data.move_to_end(block_id)
+                    result[block_id] = tensor
+
+            return len(to_read), elapsed
+        finally:
+            self._complete_inflight_reads(to_read)
 
     def _flush_dirty_blocks(
         self,
@@ -273,20 +385,9 @@ class TieredCacheManager:
             t0 = time.time()
             try:
                 to_load = []
-                with self.cache_lock:
-                    for block_id in block_ids:
-                        if block_id in self.cache_data:
-                            self.cache_data.move_to_end(block_id)
-                            continue
-
-                        with self.flushing_lock:
-                            flushing_entry = self.flushing_buffer.get(block_id)
-                        if flushing_entry is not None:
-                            tensor, _, _ = flushing_entry
-                            self.cache_data[block_id] = tensor
-                            self.cache_data.move_to_end(block_id)
-                            continue
-
+                for block_id in block_ids:
+                    tensor, _ = self._lookup_cached_or_flushing(block_id, promote_flushing=True)
+                    if tensor is None:
                         to_load.append(block_id)
 
                 if to_load:
@@ -312,6 +413,7 @@ class TieredCacheManager:
                 self.stats['future_prefetch_errors'] += 1
                 print(f"[TieredCache] Future prefetch worker error: {e}")
             finally:
+                self._complete_inflight_reads(block_ids)
                 with self.future_lock:
                     for block_id in block_ids:
                         self.future_pending.discard(block_id)
@@ -472,53 +574,76 @@ class TieredCacheManager:
         """
         result = {}
         cache_hits = []
-        cache_misses = []
+        read_ids = []
+        wait_entries = []
+        seen_block_ids = set()
         self.stats['urgent_prefetch_calls'] += 1
 
-        # Check cache for needed blocks
-        # [FIX] Check order: cache_data -> flushing_buffer -> SSD
-        with self.cache_lock:
-            for block_id in needed_block_ids:
-                if block_id in self.cache_data:
-                    result[block_id] = self.cache_data[block_id]
-                    self.cache_data.move_to_end(block_id)  # LRU update
-                    cache_hits.append(block_id)
-                else:
-                    cache_misses.append(block_id)
-        
-        # [FIX] Check flushing buffer for evicted-but-not-yet-written blocks
-        still_missing = []
-        with self.flushing_lock:
-            for block_id in cache_misses:
-                if block_id in self.flushing_buffer:
-                    tensor, timestamp, _ = self.flushing_buffer[block_id]
-                    result[block_id] = tensor
-                    cache_hits.append(block_id)  # Count as hit (avoided reading stale data)
+        # Check order: cache_data -> flushing_buffer -> in-flight read -> SSD.
+        for raw_block_id in needed_block_ids:
+            block_id = int(raw_block_id)
+            if block_id in seen_block_ids:
+                continue
+            seen_block_ids.add(block_id)
+
+            tensor, source = self._lookup_cached_or_flushing(block_id)
+            if tensor is not None:
+                result[block_id] = tensor
+                cache_hits.append(block_id)
+                if source == 'flushing':
                     print(f"[TieredCache] ⚠️ Race avoided: block {block_id} found in flushing_buffer")
-                else:
-                    still_missing.append(block_id)
-        
-        # Update cache_misses to only include blocks not in flushing_buffer
-        cache_misses = still_missing
+                continue
 
-        # Load misses from SSD
-        if cache_misses:
-            t0 = time.time()
-            loaded = self.storage.read_blocks(cache_misses)
-            elapsed = time.time() - t0
+            event, claimed = self._reserve_inflight_read(block_id)
+            if claimed:
+                read_ids.append(block_id)
+            else:
+                wait_entries.append((block_id, event))
 
-            with self.cache_lock:
-                for block_id, tensor in loaded.items():
-                    self.cache_data[block_id] = tensor
-                    self.cache_data.move_to_end(block_id)
+        actual_reads, read_time = self._read_claimed_blocks(
+            read_ids,
+            result,
+            cache_hits,
+            log_flushing_hit=True,
+        )
+
+        while wait_entries:
+            fallback_ids = []
+            next_wait_entries = []
+            for block_id, event in wait_entries:
+                self._wait_for_inflight_read(event)
+                tensor, source = self._lookup_cached_or_flushing(block_id)
+                if tensor is not None:
                     result[block_id] = tensor
-            self.stats['urgent_prefetch_blocks'] += len(cache_misses)
-            self.stats['urgent_prefetch_miss_blocks'] += len(cache_misses)
-            self.stats['urgent_prefetch_time'] += elapsed
+                    cache_hits.append(block_id)
+                    if source == 'flushing':
+                        print(f"[TieredCache] ⚠️ Race avoided: block {block_id} found in flushing_buffer")
+                    continue
+
+                retry_event, claimed = self._reserve_inflight_read(block_id)
+                if claimed:
+                    fallback_ids.append(block_id)
+                    self.stats['inflight_fallback_blocks'] += 1
+                else:
+                    next_wait_entries.append((block_id, retry_event))
+
+            fallback_reads, fallback_time = self._read_claimed_blocks(
+                fallback_ids,
+                result,
+                cache_hits,
+                log_flushing_hit=True,
+            )
+            actual_reads += fallback_reads
+            read_time += fallback_time
+            wait_entries = next_wait_entries
+
+        self.stats['urgent_prefetch_blocks'] += actual_reads
+        self.stats['urgent_prefetch_miss_blocks'] += actual_reads
+        self.stats['urgent_prefetch_time'] += read_time
 
         # Update stats
         self.stats['cache_hits'] += len(cache_hits)
-        self.stats['cache_misses'] += len(cache_misses)
+        self.stats['cache_misses'] += actual_reads
 
         # Background prefetch for future blocks
         # if future_block_ids:
@@ -554,6 +679,10 @@ class TieredCacheManager:
                     if block_id in self.future_pending:
                         skipped += 1
                         continue
+                    _, claimed = self._reserve_inflight_read(block_id)
+                    if not claimed:
+                        skipped += 1
+                        continue
                     self.future_pending.add(block_id)
                 to_prefetch.append(block_id)
 
@@ -565,8 +694,10 @@ class TieredCacheManager:
         try:
             self.future_prefetch_queue.put_nowait(to_prefetch)
             self.stats['future_prefetch_submitted'] += len(to_prefetch)
+            self.stats['future_prefetch_reserved'] += len(to_prefetch)
             return len(to_prefetch)
         except Full:
+            self._complete_inflight_reads(to_prefetch)
             with self.future_lock:
                 for block_id in to_prefetch:
                     self.future_pending.discard(block_id)
@@ -688,6 +819,8 @@ class TieredCacheManager:
         future_queue_size = self.future_prefetch_queue.qsize() if hasattr(self, 'future_prefetch_queue') else 0
         with self.future_lock:
             future_pending_count = len(self.future_pending)
+        with self.inflight_lock:
+            inflight_read_count = len(self.inflight_reads)
 
         hit_rate = 0.0
         total_accesses = self.stats['cache_hits'] + self.stats['cache_misses']
@@ -704,6 +837,7 @@ class TieredCacheManager:
             'future_pending_blocks': future_pending_count,
             'future_prefetch_queue_size': future_queue_size,
             'future_prefetch_pending': future_pending_count,
+            'inflight_read_blocks': inflight_read_count,
             'ram_usage_mb': ram_usage_mb,
             'hit_rate': hit_rate,
             'max_ram_mb': self.max_ram_bytes / 1024 / 1024
