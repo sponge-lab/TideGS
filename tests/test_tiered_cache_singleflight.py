@@ -27,6 +27,9 @@ except ModuleNotFoundError:
         def dim(self):
             return len(self.shape)
 
+        def element_size(self):
+            return 4
+
     torch = types.SimpleNamespace(
         Tensor=_FakeTensor,
         full=lambda shape, value: _FakeTensor(shape, value),

@@ -146,6 +146,10 @@ class TieredCacheManager:
             'ssd_bytes_read_future': 0,
             'ssd_bytes_written_async': 0,
             'ssd_bytes_written_sync': 0,
+            'future_prefetch_reserved': 0,
+            'inflight_wait_blocks': 0,
+            'inflight_wait_time': 0.0,
+            'inflight_fallback_blocks': 0,
         }
 
         # Start async worker threads
