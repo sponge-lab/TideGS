@@ -1847,6 +1847,7 @@ def clm_offload_train_one_batch(
     # - GPU Compute Stream: Forward/Backward on current batch
     # - GPU Prefetch Stream: Load next batch's data in background
     if storage_adapter is not None and training_schedule is not None and (use_fast_ram_ssd_path or is_paper_ssd_mode):
+        _ts('n1_prefetch_start')
         torch.cuda.nvtx.range_push("N+1 Prefetch: Start async load")
 
         try:
@@ -1933,6 +1934,7 @@ def clm_offload_train_one_batch(
                 log_file.write(f"[N+1 PREFETCH] Warning: Prefetch failed: {e}\n")
 
         torch.cuda.nvtx.range_pop()
+        _ts('n1_prefetch_done')
 
     # ============================================================================
     # STAGE 2: MICRO-BATCH SIGNAL INITIALIZATION
@@ -3241,6 +3243,8 @@ def clm_offload_train_one_batch(
                 storage_adapter=storage_adapter,
                 paper_stage_metrics=_paper_stage_metrics,
                 paper_debug_logging=paper_debug_logging,
+                model_path=getattr(args, "model_path", ""),
+                batch_size=bsz,
             )
         else:
             def _dt(a, b):

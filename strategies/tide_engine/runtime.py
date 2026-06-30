@@ -736,6 +736,10 @@ def snapshot_paper_warm_layer_metrics(storage_adapter) -> Optional[Dict[str, flo
             "cache_future_prefetch_errors": int(cache_stats.get("future_prefetch_errors", 0)),
             "cache_future_queue": int(cache_stats.get("future_prefetch_queue_size", cache_stats.get("future_queue_size", 0))),
             "cache_future_pending": int(cache_stats.get("future_prefetch_pending", cache_stats.get("future_pending_blocks", 0))),
+            "future_prefetch_reserved": int(cache_stats.get("future_prefetch_reserved", 0)),
+            "inflight_wait_blocks": int(cache_stats.get("inflight_wait_blocks", 0)),
+            "inflight_wait_time_ms": float(cache_stats.get("inflight_wait_time", 0.0) * 1000.0),
+            "inflight_fallback_blocks": int(cache_stats.get("inflight_fallback_blocks", 0)),
             "ram_usage_mb": float(cache_stats.get("ram_usage_mb", 0.0)),
             "max_ram_mb": float(cache_stats.get("max_ram_mb", 0.0)),
             "ssd_bytes_read_urgent": int(cache_stats.get("ssd_bytes_read_urgent", 0)),
@@ -806,7 +810,11 @@ def log_paper_warm_layer_metrics(storage_adapter, iteration: int, stage: str, lo
         f"future_pending={metrics.get('cache_future_pending', 0)} "
         f"future_errors={metrics.get('cache_future_prefetch_errors', 0)} "
         f"ssd_urgent_mb={metrics.get('ssd_bytes_read_urgent', 0) / (1024*1024):.1f} "
-        f"ssd_future_mb={metrics.get('ssd_bytes_read_future', 0) / (1024*1024):.1f}\n",
+        f"ssd_future_mb={metrics.get('ssd_bytes_read_future', 0) / (1024*1024):.1f} "
+        f"future_reserved={metrics.get('future_prefetch_reserved', 0)} "
+        f"inflight_wait={metrics.get('inflight_wait_blocks', 0)} "
+        f"inflight_wait_time={metrics.get('inflight_wait_time_ms', 0.0):.1f}ms "
+        f"inflight_fallback={metrics.get('inflight_fallback_blocks', 0)}\n",
         log_file=log_file,
     )
 
@@ -1387,6 +1395,153 @@ def _calc_stage_time_ms(perf_times: Dict[str, float], start: str, end: str) -> f
     return (perf_times.get(end, iter_start) - perf_times.get(start, iter_start)) * 1000.0
 
 
+METRICS_SNAPSHOT_FIELDS = [
+    "sample_idx",
+    "batch_idx",
+    "iteration",
+    "iter_end",
+    "bsz",
+    "cache_hits",
+    "cache_misses",
+    "prefetches",
+    "hit_rate_cumulative",
+    "ssd_bytes_read_urgent",
+    "ssd_bytes_read_future",
+    "ssd_bytes_written_async",
+    "ssd_bytes_written_sync",
+    "urgent_blocks",
+    "urgent_misses",
+    "future_submitted",
+    "future_blocks",
+    "future_skipped",
+    "future_reserved",
+    "inflight_wait_blocks",
+    "inflight_fallback_blocks",
+    "inflight_wait_time_ms",
+    "cache_size",
+    "dirty_blocks",
+    "flushing_blocks",
+    "flush_q",
+    "future_pending",
+    "ram_usage_mb",
+    "setup_ms",
+    "ssd_cull_load_ms",
+    "gauss_cull_legacy_ms",
+    "n1_prefetch_ms",
+    "gauss_cull_excl_n1_ms",
+    "train_ms",
+    "optim_ms",
+    "writeback_ms",
+    "total_ms",
+]
+
+_metrics_snapshot_counts: Dict[str, int] = {}
+
+
+def _format_tsv_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def _next_metrics_sample_idx(snapshot_path: str) -> int:
+    key = os.path.abspath(snapshot_path)
+    if key not in _metrics_snapshot_counts:
+        count = 0
+        if os.path.exists(snapshot_path):
+            with open(snapshot_path, "r", encoding="utf-8", errors="replace") as handle:
+                count = max(0, sum(1 for _ in handle) - 1)
+        _metrics_snapshot_counts[key] = count
+    sample_idx = _metrics_snapshot_counts[key]
+    _metrics_snapshot_counts[key] = sample_idx + 1
+    return sample_idx
+
+
+def write_paper_metrics_snapshot(
+    *,
+    iteration: int,
+    perf_times: Dict[str, float],
+    storage_adapter,
+    model_path: str,
+    batch_size: int,
+    log_file=None,
+) -> None:
+    if not model_path:
+        return
+
+    try:
+        bsz = max(1, int(batch_size or 1))
+        metrics = snapshot_paper_warm_layer_metrics(storage_adapter) or {}
+        snapshot_path = os.path.join(model_path, "metrics_snapshot.tsv")
+        os.makedirs(model_path, exist_ok=True)
+
+        n1_prefetch_ms = 0.0
+        if "n1_prefetch_start" in perf_times and "n1_prefetch_done" in perf_times:
+            n1_prefetch_ms = _calc_stage_time_ms(perf_times, "n1_prefetch_start", "n1_prefetch_done")
+        gauss_cull_legacy_ms = _calc_stage_time_ms(
+            perf_times,
+            "stage1_5_ssd_done",
+            "stage2_3_culling_done",
+        )
+
+        row: Dict[str, Any] = {
+            "sample_idx": _next_metrics_sample_idx(snapshot_path),
+            "batch_idx": (int(iteration) - 1) // bsz,
+            "iteration": int(iteration),
+            "iter_end": int(iteration) + bsz,
+            "bsz": bsz,
+            "cache_hits": int(metrics.get("cache_hits", 0)),
+            "cache_misses": int(metrics.get("cache_misses", 0)),
+            "prefetches": int(metrics.get("prefetches", 0)),
+            "hit_rate_cumulative": float(metrics.get("hit_rate", 0.0)),
+            "ssd_bytes_read_urgent": int(metrics.get("ssd_bytes_read_urgent", 0)),
+            "ssd_bytes_read_future": int(metrics.get("ssd_bytes_read_future", 0)),
+            "ssd_bytes_written_async": int(metrics.get("ssd_bytes_written_async", 0)),
+            "ssd_bytes_written_sync": int(metrics.get("ssd_bytes_written_sync", 0)),
+            "urgent_blocks": int(metrics.get("cache_urgent_prefetch_blocks", 0)),
+            "urgent_misses": int(metrics.get("cache_urgent_prefetch_miss_blocks", 0)),
+            "future_submitted": int(metrics.get("cache_future_prefetch_submitted", 0)),
+            "future_blocks": int(metrics.get("cache_future_prefetch_blocks", 0)),
+            "future_skipped": int(metrics.get("cache_future_prefetch_skipped", 0)),
+            "future_reserved": int(metrics.get("future_prefetch_reserved", 0)),
+            "inflight_wait_blocks": int(metrics.get("inflight_wait_blocks", 0)),
+            "inflight_fallback_blocks": int(metrics.get("inflight_fallback_blocks", 0)),
+            "inflight_wait_time_ms": float(metrics.get("inflight_wait_time_ms", 0.0)),
+            "cache_size": int(metrics.get("cache_size", 0)),
+            "dirty_blocks": int(metrics.get("dirty_blocks", 0)),
+            "flushing_blocks": int(metrics.get("flushing_blocks", 0)),
+            "flush_q": int(metrics.get("flush_queue_size", 0)),
+            "future_pending": int(metrics.get("cache_future_pending", 0)),
+            "ram_usage_mb": float(metrics.get("ram_usage_mb", 0.0)),
+            "setup_ms": _calc_stage_time_ms(perf_times, "iter_start", "stage1_setup_done"),
+            "ssd_cull_load_ms": _calc_stage_time_ms(perf_times, "stage1_setup_done", "stage1_5_ssd_done"),
+            "gauss_cull_legacy_ms": gauss_cull_legacy_ms,
+            "n1_prefetch_ms": n1_prefetch_ms,
+            "gauss_cull_excl_n1_ms": max(0.0, gauss_cull_legacy_ms - n1_prefetch_ms),
+            "train_ms": _calc_stage_time_ms(perf_times, "stage2_3_culling_done", "stage4_train_done"),
+            "optim_ms": _calc_stage_time_ms(perf_times, "stage5_optim_start", "stage5_optim_done"),
+            "writeback_ms": _calc_stage_time_ms(perf_times, "stage5_optim_done", "stage5_writeback_done"),
+            "total_ms": _calc_stage_time_ms(perf_times, "iter_start", "iter_end"),
+        }
+
+        needs_header = (not os.path.exists(snapshot_path)) or os.path.getsize(snapshot_path) == 0
+        with open(snapshot_path, "a", encoding="utf-8") as handle:
+            if needs_header:
+                handle.write("\t".join(METRICS_SNAPSHOT_FIELDS) + "\n")
+            handle.write("\t".join(_format_tsv_value(row.get(field, "")) for field in METRICS_SNAPSHOT_FIELDS) + "\n")
+    except Exception as exc:
+        msg = f"[METRICS SNAPSHOT] Warning: failed to write metrics_snapshot.tsv: {exc}\n"
+        if log_file is not None:
+            log_file.write(msg)
+        write_paper_phase1_log(msg, log_file=None)
+
+
 # Per-session snapshot for computing flush deltas between stage-detail log lines.
 _prev_flush_snapshot: Dict[str, int] = {
     'async_flush_jobs': 0,
@@ -1552,25 +1707,43 @@ def log_paper_perf_profile(
     storage_adapter=None,
     paper_stage_metrics: Optional[Dict[str, Any]] = None,
     paper_debug_logging: bool = False,
+    model_path: str = "",
+    batch_size: int = 0,
 ) -> None:
     def _dt(start: str, end: str) -> float:
         iter_start = perf_times["iter_start"]
         return (perf_times.get(end, iter_start) - perf_times.get(start, iter_start)) * 1000.0
 
+    n1_prefetch_ms = 0.0
+    if "n1_prefetch_start" in perf_times and "n1_prefetch_done" in perf_times:
+        n1_prefetch_ms = _dt("n1_prefetch_start", "n1_prefetch_done")
+    gauss_cull_legacy_ms = _dt("stage1_5_ssd_done", "stage2_3_culling_done")
+    gauss_cull_excl_n1_ms = max(0.0, gauss_cull_legacy_ms - n1_prefetch_ms)
+
     perf_message = (
         f"[PERF] Iter {iteration}: "
         f"setup={_dt('iter_start','stage1_setup_done'):.0f}ms  "
         f"ssd_cull+load={_dt('stage1_setup_done','stage1_5_ssd_done'):.0f}ms  "
-        f"gauss_cull={_dt('stage1_5_ssd_done','stage2_3_culling_done'):.0f}ms  "
+        f"gauss_cull={gauss_cull_legacy_ms:.0f}ms  "
         f"train={_dt('stage2_3_culling_done','stage4_train_done'):.0f}ms  "
         f"optim={_dt('stage5_optim_start','stage5_optim_done'):.0f}ms  "
         f"writeback={_dt('stage5_optim_done','stage5_writeback_done'):.0f}ms  "
         f"cuda_sync={_dt('stage5_writeback_done','stage5_sync_done'):.0f}ms  "
         f"cleanup={_dt('stage5_sync_done','iter_end'):.0f}ms  "
-        f"TOTAL={_dt('iter_start','iter_end'):.0f}ms\n"
+        f"TOTAL={_dt('iter_start','iter_end'):.0f}ms  "
+        f"n1_prefetch={n1_prefetch_ms:.0f}ms  "
+        f"gauss_cull_excl_n1={gauss_cull_excl_n1_ms:.0f}ms\n"
     )
     log_file.write(perf_message)
     write_paper_phase1_log(perf_message, log_file=None)
+    write_paper_metrics_snapshot(
+        iteration=iteration,
+        perf_times=perf_times,
+        storage_adapter=storage_adapter,
+        model_path=model_path,
+        batch_size=batch_size,
+        log_file=log_file,
+    )
     log_paper_warm_layer_metrics(storage_adapter, iteration, "perf", log_file=log_file)
     if paper_debug_logging and paper_stage_metrics:
         log_paper_stage_detail(
