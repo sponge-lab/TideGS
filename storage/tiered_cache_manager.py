@@ -138,10 +138,12 @@ class TieredCacheManager:
             'future_prefetch_blocks': 0,
             'future_prefetch_time': 0.0,
             'future_prefetch_errors': 0,
-            'future_prefetch_reserved': 0,
-            'inflight_wait_blocks': 0,
-            'inflight_wait_time': 0.0,
-            'inflight_fallback_blocks': 0,
+            'urgent_storage_read_calls': 0,
+            'urgent_storage_read_blocks': 0,
+            'urgent_storage_read_time': 0.0,
+            'future_storage_read_calls': 0,
+            'future_storage_read_blocks': 0,
+            'future_storage_read_time': 0.0,
             'ssd_bytes_read_urgent': 0,
             'ssd_bytes_read_future': 0,
             'ssd_bytes_written_async': 0,
@@ -278,6 +280,9 @@ class TieredCacheManager:
         try:
             loaded = self.storage.read_blocks(to_read)
             elapsed = time.time() - t0
+            self.stats['urgent_storage_read_calls'] += 1
+            self.stats['urgent_storage_read_blocks'] += len(loaded)
+            self.stats['urgent_storage_read_time'] += elapsed
 
             with self.cache_lock:
                 for block_id, tensor in loaded.items():
@@ -405,7 +410,12 @@ class TieredCacheManager:
                         to_load.append(block_id)
 
                 if to_load:
+                    read_t0 = time.time()
                     loaded = self.storage.read_blocks(to_load)
+                    read_elapsed = time.time() - read_t0
+                    self.stats['future_storage_read_calls'] += 1
+                    self.stats['future_storage_read_blocks'] += len(loaded)
+                    self.stats['future_storage_read_time'] += read_elapsed
                     if loaded:
                         loaded_bytes = sum(
                             t.numel() * t.element_size() if torch.is_tensor(t) else self.bytes_per_block
@@ -861,6 +871,7 @@ class TieredCacheManager:
             'inflight_read_blocks': inflight_read_count,
             'ram_usage_mb': ram_usage_mb,
             'hit_rate': hit_rate,
+            'bytes_per_block': self.bytes_per_block,
             'max_ram_mb': self.max_ram_bytes / 1024 / 1024
         }
 

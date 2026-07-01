@@ -58,6 +58,17 @@ FIELDS = [
     "stage1_5g_ab_prefetch_time_s",
     "ssd_bytes_read_urgent_gb",
     "ssd_bytes_read_future_gb",
+    "peak_future_read_blocks",
+    "peak_future_read_mb",
+    "peak_future_read_blocks_vs_rt",
+    "peak_future_read_blocks_vs_cap",
+    "peak_future_read_batch_idx",
+    "peak_delta_plus",
+    "peak_cap_transfer_share_at_3p3gibs",
+    "avg_future_storage_read_time_ms",
+    "avg_future_storage_read_share_pct",
+    "avg_future_storage_read_bw_mb_s",
+    "peak_future_storage_read_time_ms",
     "ab_prefetch_hit_count",
     "ab_prefetch_miss_count",
     "dirty_blocks_before_shutdown",
@@ -108,6 +119,7 @@ FIELDS = [
 
 METRICS_SNAPSHOT_NAME = "metrics_snapshot.tsv"
 METRICS_WINDOW_NAME = "metrics_window.tsv"
+METRICS_BATCH_NAME = "metrics_batch.tsv"
 
 METRICS_WINDOW_FIELDS = [
     "sample_idx",
@@ -130,6 +142,12 @@ METRICS_WINDOW_FIELDS = [
     "delta_future_blocks",
     "delta_future_skipped",
     "delta_future_reserved",
+    "delta_urgent_storage_read_calls",
+    "delta_urgent_storage_read_blocks",
+    "delta_urgent_storage_read_time_ms",
+    "delta_future_storage_read_calls",
+    "delta_future_storage_read_blocks",
+    "delta_future_storage_read_time_ms",
     "delta_inflight_wait_blocks",
     "delta_inflight_fallback_blocks",
     "delta_inflight_wait_time_ms",
@@ -160,6 +178,12 @@ METRICS_COUNTER_FIELDS = [
     "future_blocks",
     "future_skipped",
     "future_reserved",
+    "urgent_storage_read_calls",
+    "urgent_storage_read_blocks",
+    "urgent_storage_read_time_ms",
+    "future_storage_read_calls",
+    "future_storage_read_blocks",
+    "future_storage_read_time_ms",
     "inflight_wait_blocks",
     "inflight_fallback_blocks",
     "inflight_wait_time_ms",
@@ -185,6 +209,7 @@ METRICS_GAUGE_FIELDS = [
     "flushing_blocks",
     "flush_q",
     "future_pending",
+    "bytes_per_block",
     "ram_usage_mb",
 ]
 
@@ -615,6 +640,8 @@ def summarize_log(log_path: Path) -> Dict[str, object]:
         )
         summary["kt_resident_coverage_min"] = min(kt_resident_coverage_values)
 
+    update_metrics_batch_peak_summary(log_path.parent, summary)
+
     summary["status"] = "ok" if summary["training_complete"] and int(summary["errors"]) == 0 else "failed"
     gpu_peak = _float_or_none(summary.get("gpu_peak_gb"))
     ram_cache = _float_or_none(summary.get("ram_cache_gb"))
@@ -699,6 +726,57 @@ def _metric_delta(cur: Dict[str, Any], prev: Dict[str, Any] | None, key: str) ->
     return _metric_number(cur, key) - _metric_number(prev, key)
 
 
+def update_metrics_batch_peak_summary(run_dir: Path, summary: Dict[str, object]) -> None:
+    batch_path = run_dir / METRICS_BATCH_NAME
+    if not batch_path.is_file():
+        return
+    with open(batch_path, "r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    if not rows:
+        return
+
+    non_reset = [row for row in rows if int(_metric_number(row, "reset")) == 0]
+    candidates = non_reset or rows
+    peak = max(candidates, key=lambda row: _metric_number(row, "future_read_blocks_delta"))
+    summary["peak_future_read_blocks"] = _metric_number(peak, "future_read_blocks_delta")
+    summary["peak_future_read_mb"] = _metric_number(peak, "future_read_mb_delta")
+    summary["peak_future_read_blocks_vs_rt"] = _metric_number(peak, "future_read_blocks_vs_rt")
+    summary["peak_future_read_blocks_vs_cap"] = (
+        _metric_number(peak, "future_read_blocks_vs_cap")
+        or _metric_number(peak, "future_read_blocks_vs_rt")
+    )
+    summary["peak_future_read_batch_idx"] = _metric_index_value(peak, "batch_idx")
+    summary["peak_delta_plus"] = _metric_number(peak, "delta_plus")
+    summary["peak_cap_transfer_share_at_3p3gibs"] = _metric_number(peak, "cap_transfer_share_at_3p3gibs")
+
+    total_future_read_time_ms = sum(_metric_number(row, "future_storage_read_time_ms_delta") for row in candidates)
+    total_future_read_mb = sum(_metric_number(row, "future_read_mb_delta") for row in candidates)
+    total_ms = sum(_metric_number(row, "total_ms") for row in candidates)
+    summary["avg_future_storage_read_time_ms"] = total_future_read_time_ms / len(candidates) if candidates else ""
+    summary["avg_future_storage_read_share_pct"] = (
+        100.0 * total_future_read_time_ms / total_ms if total_ms > 0.0 else ""
+    )
+    summary["avg_future_storage_read_bw_mb_s"] = (
+        total_future_read_mb / (total_future_read_time_ms / 1000.0)
+        if total_future_read_time_ms > 0.0 else ""
+    )
+    summary["peak_future_storage_read_time_ms"] = max(
+        (_metric_number(row, "future_storage_read_time_ms_delta") for row in candidates),
+        default=0.0,
+    )
+
+
+def _metrics_window_reset(cur: Dict[str, Any], prev: Dict[str, Any] | None) -> bool:
+    if prev is None:
+        return False
+    if _metric_number(cur, "batch_idx") <= _metric_number(prev, "batch_idx"):
+        return True
+    for key in METRICS_COUNTER_FIELDS + METRICS_BYTE_COUNTER_FIELDS:
+        if _metric_number(cur, key) < _metric_number(prev, key):
+            return True
+    return False
+
+
 def _metric_index_value(row: Dict[str, Any], key: str) -> int | str:
     value = row.get(key, "")
     if value in ("", None):
@@ -713,11 +791,12 @@ def derive_metrics_window_rows(snapshot_rows: List[Dict[str, Any]]) -> List[Dict
     window_rows: List[Dict[str, object]] = []
     prev: Dict[str, Any] | None = None
     for cur in snapshot_rows:
-        delta_hits = _metric_delta(cur, prev, "cache_hits")
-        delta_misses = _metric_delta(cur, prev, "cache_misses")
+        delta_base = None if _metrics_window_reset(cur, prev) else prev
+        delta_hits = _metric_delta(cur, delta_base, "cache_hits")
+        delta_misses = _metric_delta(cur, delta_base, "cache_misses")
         total_lookups = delta_hits + delta_misses
         batch_idx = _metric_number(cur, "batch_idx")
-        prev_batch_idx = _metric_number(prev, "batch_idx") if prev is not None else batch_idx
+        prev_batch_idx = _metric_number(delta_base, "batch_idx") if delta_base is not None else batch_idx
 
         row: Dict[str, object] = {
             "sample_idx": _metric_index_value(cur, "sample_idx"),
@@ -734,10 +813,10 @@ def derive_metrics_window_rows(snapshot_rows: List[Dict[str, Any]]) -> List[Dict
         for field in METRICS_COUNTER_FIELDS:
             if field in ("cache_hits", "cache_misses"):
                 continue
-            row[f"delta_{field}"] = _metric_delta(cur, prev, field)
+            row[f"delta_{field}"] = _metric_delta(cur, delta_base, field)
 
         for field in METRICS_BYTE_COUNTER_FIELDS:
-            row[METRICS_BYTE_OUTPUT_FIELDS[field]] = _metric_delta(cur, prev, field) / (1024 * 1024)
+            row[METRICS_BYTE_OUTPUT_FIELDS[field]] = _metric_delta(cur, delta_base, field) / (1024 * 1024)
 
         for field in METRICS_GAUGE_FIELDS:
             row[field] = _metric_number(cur, field)

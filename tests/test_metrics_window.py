@@ -26,6 +26,12 @@ class MetricsWindowTest(unittest.TestCase):
                 "future_blocks": "13",
                 "future_skipped": "2",
                 "future_reserved": "17",
+                "urgent_storage_read_calls": "1",
+                "urgent_storage_read_blocks": "2",
+                "urgent_storage_read_time_ms": "4.0",
+                "future_storage_read_calls": "3",
+                "future_storage_read_blocks": "13",
+                "future_storage_read_time_ms": "30.0",
                 "inflight_wait_blocks": "19",
                 "inflight_fallback_blocks": "1",
                 "inflight_wait_time_ms": "31.5",
@@ -65,6 +71,12 @@ class MetricsWindowTest(unittest.TestCase):
                 "future_blocks": "25",
                 "future_skipped": "4",
                 "future_reserved": "30",
+                "urgent_storage_read_calls": "2",
+                "urgent_storage_read_blocks": "3",
+                "urgent_storage_read_time_ms": "6.5",
+                "future_storage_read_calls": "5",
+                "future_storage_read_blocks": "25",
+                "future_storage_read_time_ms": "51.0",
                 "inflight_wait_blocks": "22",
                 "inflight_fallback_blocks": "3",
                 "inflight_wait_time_ms": "44.0",
@@ -100,6 +112,8 @@ class MetricsWindowTest(unittest.TestCase):
         self.assertEqual(windows[1]["delta_ssd_write_async_mb"], 5.0)
         self.assertEqual(windows[1]["delta_ssd_write_sync_mb"], 0.0)
         self.assertEqual(windows[1]["delta_future_reserved"], 13.0)
+        self.assertEqual(windows[1]["delta_future_storage_read_time_ms"], 21.0)
+        self.assertEqual(windows[1]["delta_urgent_storage_read_blocks"], 1.0)
         self.assertEqual(windows[1]["delta_inflight_wait_time_ms"], 12.5)
         self.assertEqual(windows[1]["cache_size"], 15.0)
         self.assertEqual(windows[1]["dirty_blocks"], 8.0)
@@ -134,10 +148,48 @@ class MetricsWindowTest(unittest.TestCase):
         self.assertEqual(windows[1]["delta_cache_misses"], 3.0)
         self.assertAlmostEqual(windows[1]["window_hit_rate"], 0.4)
         self.assertEqual(windows[1]["delta_future_reserved"], 0.0)
+        self.assertEqual(windows[1]["delta_future_storage_read_time_ms"], 0.0)
         self.assertEqual(windows[1]["delta_inflight_wait_blocks"], 0.0)
         self.assertEqual(windows[1]["delta_ssd_read_future_mb"], 0.0)
         self.assertEqual(windows[1]["cache_size"], 0.0)
         self.assertEqual(windows[1]["n1_prefetch_ms"], 0.0)
+
+    def test_restarted_snapshot_append_starts_new_window(self):
+        snapshot_rows = [
+            {
+                "sample_idx": "0",
+                "batch_idx": "0",
+                "iteration": "1",
+                "cache_hits": "10",
+                "cache_misses": "2",
+                "ssd_bytes_read_future": str(4 * 1024 * 1024),
+            },
+            {
+                "sample_idx": "1",
+                "batch_idx": "5",
+                "iteration": "41",
+                "cache_hits": "20",
+                "cache_misses": "2",
+                "ssd_bytes_read_future": str(7 * 1024 * 1024),
+            },
+            {
+                "sample_idx": "2",
+                "batch_idx": "0",
+                "iteration": "1",
+                "cache_hits": "9",
+                "cache_misses": "1",
+                "ssd_bytes_read_future": str(3 * 1024 * 1024),
+            },
+        ]
+
+        windows = derive_metrics_window_rows(snapshot_rows)
+
+        self.assertEqual(windows[1]["delta_cache_hits"], 10.0)
+        self.assertEqual(windows[1]["delta_ssd_read_future_mb"], 3.0)
+        self.assertEqual(windows[2]["window_batches"], 0.0)
+        self.assertEqual(windows[2]["delta_cache_hits"], 0.0)
+        self.assertEqual(windows[2]["delta_cache_misses"], 0.0)
+        self.assertEqual(windows[2]["delta_ssd_read_future_mb"], 0.0)
 
 
 if __name__ == "__main__":

@@ -734,6 +734,12 @@ def snapshot_paper_warm_layer_metrics(storage_adapter) -> Optional[Dict[str, flo
             "cache_future_prefetch_blocks": int(cache_stats.get("future_prefetch_blocks", 0)),
             "cache_future_prefetch_time_ms": float(cache_stats.get("future_prefetch_time", 0.0) * 1000.0),
             "cache_future_prefetch_errors": int(cache_stats.get("future_prefetch_errors", 0)),
+            "urgent_storage_read_calls": int(cache_stats.get("urgent_storage_read_calls", 0)),
+            "urgent_storage_read_blocks": int(cache_stats.get("urgent_storage_read_blocks", 0)),
+            "urgent_storage_read_time_ms": float(cache_stats.get("urgent_storage_read_time", 0.0) * 1000.0),
+            "future_storage_read_calls": int(cache_stats.get("future_storage_read_calls", 0)),
+            "future_storage_read_blocks": int(cache_stats.get("future_storage_read_blocks", 0)),
+            "future_storage_read_time_ms": float(cache_stats.get("future_storage_read_time", 0.0) * 1000.0),
             "cache_future_queue": int(cache_stats.get("future_prefetch_queue_size", cache_stats.get("future_queue_size", 0))),
             "cache_future_pending": int(cache_stats.get("future_prefetch_pending", cache_stats.get("future_pending_blocks", 0))),
             "future_prefetch_reserved": int(cache_stats.get("future_prefetch_reserved", 0)),
@@ -746,6 +752,7 @@ def snapshot_paper_warm_layer_metrics(storage_adapter) -> Optional[Dict[str, flo
             "ssd_bytes_read_future": int(cache_stats.get("ssd_bytes_read_future", 0)),
             "ssd_bytes_written_async": int(cache_stats.get("ssd_bytes_written_async", 0)),
             "ssd_bytes_written_sync": int(cache_stats.get("ssd_bytes_written_sync", 0)),
+            "bytes_per_block": int(cache_stats.get("bytes_per_block", 0)),
             "async_flush_jobs": int(cache_stats.get("async_flush_jobs", 0)),
         })
 
@@ -1329,28 +1336,43 @@ def apply_paper_writeback_payload(
 
     refreshed_omega = 0
     if len(omega_blocks) > 0:
-        omega_refresh_blocks = {
-            block_id: updated_blocks_dict[block_id]
-            for block_id in omega_blocks
-            if block_id in updated_blocks_dict
-        }
-        missing_omega_blocks = [
-            block_id for block_id in omega_blocks
-            if block_id not in omega_refresh_blocks
+        updated_block_set = set(int(block_id) for block_id in updated_blocks_dict.keys())
+        updated_omega_blocks = [
+            int(block_id) for block_id in omega_blocks
+            if int(block_id) in updated_block_set
         ]
-        if missing_omega_blocks:
-            omega_refresh_blocks.update(storage_adapter.cache.prefetch(missing_omega_blocks))
+        if updated_omega_blocks:
+            double_buffer = get_double_buffer_gpu_fn(
+                num_total=total_n_gaussians,
+                block_size=args.gaussian_block_size,
+                device="cuda",
+            )
 
-        double_buffer = get_double_buffer_gpu_fn(
-            num_total=total_n_gaussians,
-            block_size=args.gaussian_block_size,
-            device="cuda",
-        )
-        refreshed_omega = double_buffer.refresh_blocks_from_block_cache(
-            block_cache=omega_refresh_blocks,
-            block_ids=omega_blocks,
-            target="loading",
-        )
+            gpu_refreshed_blocks = set()
+            refresh_from_active = getattr(double_buffer, "refresh_blocks_from_active_buffer", None)
+            if callable(refresh_from_active):
+                gpu_refreshed_blocks = set(
+                    int(block_id)
+                    for block_id in (refresh_from_active(updated_omega_blocks, target="loading") or set())
+                )
+
+            cpu_refresh_blocks = [
+                block_id for block_id in updated_omega_blocks
+                if block_id not in gpu_refreshed_blocks
+            ]
+            if cpu_refresh_blocks:
+                omega_refresh_blocks = {
+                    block_id: updated_blocks_dict[block_id]
+                    for block_id in cpu_refresh_blocks
+                    if block_id in updated_blocks_dict
+                }
+                refreshed_omega += double_buffer.refresh_blocks_from_block_cache(
+                    block_cache=omega_refresh_blocks,
+                    block_ids=cpu_refresh_blocks,
+                    target="loading",
+                )
+
+            refreshed_omega += len(gpu_refreshed_blocks)
 
     return staged_writeback_blocks, refreshed_omega, len(updated_block_ids)
 
@@ -1415,9 +1437,16 @@ METRICS_SNAPSHOT_FIELDS = [
     "future_blocks",
     "future_skipped",
     "future_reserved",
+    "urgent_storage_read_calls",
+    "urgent_storage_read_blocks",
+    "urgent_storage_read_time_ms",
+    "future_storage_read_calls",
+    "future_storage_read_blocks",
+    "future_storage_read_time_ms",
     "inflight_wait_blocks",
     "inflight_fallback_blocks",
     "inflight_wait_time_ms",
+    "bytes_per_block",
     "cache_size",
     "dirty_blocks",
     "flushing_blocks",
@@ -1435,7 +1464,59 @@ METRICS_SNAPSHOT_FIELDS = [
     "total_ms",
 ]
 
+METRICS_BATCH_FIELDS = [
+    "sample_idx",
+    "batch_idx",
+    "iteration",
+    "iter_end",
+    "bsz",
+    "reset",
+    "resident_capacity",
+    "r_t_size",
+    "r_t_next_size",
+    "k_t_size",
+    "k_t_next_size",
+    "delta_plus",
+    "delta_minus",
+    "hint_requested",
+    "hint_submitted",
+    "future_read_blocks_delta",
+    "future_read_mb_delta",
+    "urgent_read_blocks_delta",
+    "urgent_read_mb_delta",
+    "future_storage_read_calls_delta",
+    "future_storage_read_blocks_delta",
+    "future_storage_read_time_ms_delta",
+    "future_storage_read_bw_mb_s",
+    "urgent_storage_read_calls_delta",
+    "urgent_storage_read_blocks_delta",
+    "urgent_storage_read_time_ms_delta",
+    "urgent_storage_read_bw_mb_s",
+    "future_reserved_delta",
+    "inflight_wait_blocks_delta",
+    "inflight_fallback_blocks_delta",
+    "inflight_wait_time_ms_delta",
+    "bytes_per_block",
+    "cap_read_mb",
+    "cap_transfer_ms_at_3p3gibs",
+    "cap_transfer_share_at_3p3gibs",
+    "cache_size",
+    "dirty_blocks",
+    "ram_usage_mb",
+    "setup_ms",
+    "ssd_cull_load_ms",
+    "n1_prefetch_ms",
+    "gauss_cull_excl_n1_ms",
+    "train_ms",
+    "optim_ms",
+    "writeback_ms",
+    "total_ms",
+    "future_read_blocks_vs_rt",
+    "future_read_blocks_vs_cap",
+]
+
 _metrics_snapshot_counts: Dict[str, int] = {}
+_metrics_batch_prev: Dict[str, Dict[str, Any]] = {}
 
 
 def _format_tsv_value(value: Any) -> str:
@@ -1461,6 +1542,211 @@ def _next_metrics_sample_idx(snapshot_path: str) -> int:
     sample_idx = _metrics_snapshot_counts[key]
     _metrics_snapshot_counts[key] = sample_idx + 1
     return sample_idx
+
+
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    if value in ("", None):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float_value(value: Any, default: float = 0.0) -> float:
+    if value in ("", None):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metrics_batch_reset(cur: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> bool:
+    if prev is None:
+        return True
+    if _safe_int_value(cur.get("batch_idx")) <= _safe_int_value(prev.get("batch_idx")):
+        return True
+    counter_fields = (
+        "future_blocks",
+        "urgent_blocks",
+        "ssd_bytes_read_future",
+        "ssd_bytes_read_urgent",
+        "future_storage_read_calls",
+        "future_storage_read_blocks",
+        "future_storage_read_time_ms",
+        "urgent_storage_read_calls",
+        "urgent_storage_read_blocks",
+        "urgent_storage_read_time_ms",
+        "future_reserved",
+        "inflight_wait_blocks",
+        "inflight_fallback_blocks",
+        "inflight_wait_time_ms",
+    )
+    return any(
+        _safe_float_value(cur.get(field)) < _safe_float_value(prev.get(field))
+        for field in counter_fields
+    )
+
+
+def _current_paper_resident_capacity() -> int:
+    try:
+        import utils.general_utils as utils
+
+        args = utils.get_args()
+        return _safe_int_value(
+            getattr(args, "paper_resident_capacity_blocks", None),
+            _safe_int_value(getattr(args, "tide_resident_capacity_blocks", None)),
+        )
+    except Exception:
+        return 0
+
+
+def write_paper_metrics_batch(
+    *,
+    iteration: int,
+    perf_times: Dict[str, float],
+    storage_adapter,
+    model_path: str,
+    batch_size: int,
+    paper_stage_metrics: Optional[Dict[str, Any]] = None,
+    log_file=None,
+) -> None:
+    if not model_path:
+        return
+
+    try:
+        bsz = max(1, int(batch_size or 1))
+        metrics = snapshot_paper_warm_layer_metrics(storage_adapter) or {}
+        stage_metrics = paper_stage_metrics or {}
+        batch_path = os.path.join(model_path, "metrics_batch.tsv")
+        os.makedirs(model_path, exist_ok=True)
+
+        batch_idx = (int(iteration) - 1) // bsz
+        n1_prefetch_ms = 0.0
+        if "n1_prefetch_start" in perf_times and "n1_prefetch_done" in perf_times:
+            n1_prefetch_ms = _calc_stage_time_ms(perf_times, "n1_prefetch_start", "n1_prefetch_done")
+        gauss_cull_legacy_ms = _calc_stage_time_ms(
+            perf_times,
+            "stage1_5_ssd_done",
+            "stage2_3_culling_done",
+        )
+
+        cur_counters: Dict[str, Any] = {
+            "batch_idx": batch_idx,
+            "future_blocks": int(metrics.get("cache_future_prefetch_blocks", 0)),
+            "urgent_blocks": int(metrics.get("cache_urgent_prefetch_blocks", 0)),
+            "ssd_bytes_read_future": int(metrics.get("ssd_bytes_read_future", 0)),
+            "ssd_bytes_read_urgent": int(metrics.get("ssd_bytes_read_urgent", 0)),
+            "future_storage_read_calls": int(metrics.get("future_storage_read_calls", 0)),
+            "future_storage_read_blocks": int(metrics.get("future_storage_read_blocks", 0)),
+            "future_storage_read_time_ms": float(metrics.get("future_storage_read_time_ms", 0.0)),
+            "urgent_storage_read_calls": int(metrics.get("urgent_storage_read_calls", 0)),
+            "urgent_storage_read_blocks": int(metrics.get("urgent_storage_read_blocks", 0)),
+            "urgent_storage_read_time_ms": float(metrics.get("urgent_storage_read_time_ms", 0.0)),
+            "future_reserved": int(metrics.get("future_prefetch_reserved", 0)),
+            "inflight_wait_blocks": int(metrics.get("inflight_wait_blocks", 0)),
+            "inflight_fallback_blocks": int(metrics.get("inflight_fallback_blocks", 0)),
+            "inflight_wait_time_ms": float(metrics.get("inflight_wait_time_ms", 0.0)),
+        }
+        key = os.path.abspath(batch_path)
+        prev_counters = _metrics_batch_prev.get(key)
+        reset = _metrics_batch_reset(cur_counters, prev_counters)
+
+        def delta(field: str) -> float:
+            if reset or prev_counters is None:
+                return 0.0
+            return max(0.0, _safe_float_value(cur_counters.get(field)) - _safe_float_value(prev_counters.get(field)))
+
+        resident_capacity = _safe_int_value(
+            stage_metrics.get("resident_capacity"),
+            _current_paper_resident_capacity(),
+        )
+        future_read_blocks_delta = delta("future_blocks")
+        future_read_mb_delta = delta("ssd_bytes_read_future") / (1024 * 1024)
+        urgent_read_mb_delta = delta("ssd_bytes_read_urgent") / (1024 * 1024)
+        future_storage_read_time_ms_delta = delta("future_storage_read_time_ms")
+        urgent_storage_read_time_ms_delta = delta("urgent_storage_read_time_ms")
+        future_storage_read_bw_mb_s: Any = ""
+        if future_storage_read_time_ms_delta > 0.0:
+            future_storage_read_bw_mb_s = future_read_mb_delta / (future_storage_read_time_ms_delta / 1000.0)
+        urgent_storage_read_bw_mb_s: Any = ""
+        if urgent_storage_read_time_ms_delta > 0.0:
+            urgent_storage_read_bw_mb_s = urgent_read_mb_delta / (urgent_storage_read_time_ms_delta / 1000.0)
+        bytes_per_block = _safe_int_value(metrics.get("bytes_per_block"))
+        cap_read_mb = resident_capacity * bytes_per_block / (1024 * 1024) if resident_capacity > 0 and bytes_per_block > 0 else 0.0
+        cap_transfer_ms_at_3p3gibs = cap_read_mb / (3.3 * 1024) * 1000.0 if cap_read_mb > 0.0 else 0.0
+        total_ms = _calc_stage_time_ms(perf_times, "iter_start", "iter_end")
+        cap_transfer_share_at_3p3gibs: Any = ""
+        if total_ms > 0.0 and cap_transfer_ms_at_3p3gibs > 0.0:
+            cap_transfer_share_at_3p3gibs = cap_transfer_ms_at_3p3gibs / total_ms
+        future_read_blocks_vs_rt: Any = ""
+        if resident_capacity > 0:
+            future_read_blocks_vs_rt = future_read_blocks_delta / float(resident_capacity)
+        future_read_blocks_vs_cap = future_read_blocks_vs_rt
+
+        row: Dict[str, Any] = {
+            "sample_idx": _next_metrics_sample_idx(batch_path),
+            "batch_idx": batch_idx,
+            "iteration": int(iteration),
+            "iter_end": int(iteration) + bsz,
+            "bsz": bsz,
+            "reset": 1 if reset else 0,
+            "resident_capacity": resident_capacity,
+            "r_t_size": _safe_int_value(stage_metrics.get("r_t_size")),
+            "r_t_next_size": _safe_int_value(stage_metrics.get("r_t_next_size")),
+            "k_t_size": _safe_int_value(stage_metrics.get("k_t_size")),
+            "k_t_next_size": _safe_int_value(stage_metrics.get("k_t_next_size")),
+            "delta_plus": _safe_int_value(stage_metrics.get("delta_plus")),
+            "delta_minus": _safe_int_value(stage_metrics.get("delta_minus")),
+            "hint_requested": _safe_int_value(stage_metrics.get("hint_requested")),
+            "hint_submitted": _safe_int_value(stage_metrics.get("hint_submitted")),
+            "future_read_blocks_delta": future_read_blocks_delta,
+            "future_read_mb_delta": future_read_mb_delta,
+            "urgent_read_blocks_delta": delta("urgent_blocks"),
+            "urgent_read_mb_delta": urgent_read_mb_delta,
+            "future_storage_read_calls_delta": delta("future_storage_read_calls"),
+            "future_storage_read_blocks_delta": delta("future_storage_read_blocks"),
+            "future_storage_read_time_ms_delta": future_storage_read_time_ms_delta,
+            "future_storage_read_bw_mb_s": future_storage_read_bw_mb_s,
+            "urgent_storage_read_calls_delta": delta("urgent_storage_read_calls"),
+            "urgent_storage_read_blocks_delta": delta("urgent_storage_read_blocks"),
+            "urgent_storage_read_time_ms_delta": urgent_storage_read_time_ms_delta,
+            "urgent_storage_read_bw_mb_s": urgent_storage_read_bw_mb_s,
+            "future_reserved_delta": delta("future_reserved"),
+            "inflight_wait_blocks_delta": delta("inflight_wait_blocks"),
+            "inflight_fallback_blocks_delta": delta("inflight_fallback_blocks"),
+            "inflight_wait_time_ms_delta": delta("inflight_wait_time_ms"),
+            "bytes_per_block": bytes_per_block,
+            "cap_read_mb": cap_read_mb,
+            "cap_transfer_ms_at_3p3gibs": cap_transfer_ms_at_3p3gibs,
+            "cap_transfer_share_at_3p3gibs": cap_transfer_share_at_3p3gibs,
+            "cache_size": int(metrics.get("cache_size", 0)),
+            "dirty_blocks": int(metrics.get("dirty_blocks", 0)),
+            "ram_usage_mb": float(metrics.get("ram_usage_mb", 0.0)),
+            "setup_ms": _calc_stage_time_ms(perf_times, "iter_start", "stage1_setup_done"),
+            "ssd_cull_load_ms": _calc_stage_time_ms(perf_times, "stage1_setup_done", "stage1_5_ssd_done"),
+            "n1_prefetch_ms": n1_prefetch_ms,
+            "gauss_cull_excl_n1_ms": max(0.0, gauss_cull_legacy_ms - n1_prefetch_ms),
+            "train_ms": _calc_stage_time_ms(perf_times, "stage2_3_culling_done", "stage4_train_done"),
+            "optim_ms": _calc_stage_time_ms(perf_times, "stage5_optim_start", "stage5_optim_done"),
+            "writeback_ms": _calc_stage_time_ms(perf_times, "stage5_optim_done", "stage5_writeback_done"),
+            "total_ms": total_ms,
+            "future_read_blocks_vs_rt": future_read_blocks_vs_rt,
+            "future_read_blocks_vs_cap": future_read_blocks_vs_cap,
+        }
+
+        needs_header = (not os.path.exists(batch_path)) or os.path.getsize(batch_path) == 0
+        with open(batch_path, "a", encoding="utf-8") as handle:
+            if needs_header:
+                handle.write("\t".join(METRICS_BATCH_FIELDS) + "\n")
+            handle.write("\t".join(_format_tsv_value(row.get(field, "")) for field in METRICS_BATCH_FIELDS) + "\n")
+        _metrics_batch_prev[key] = cur_counters
+    except Exception as exc:
+        msg = f"[METRICS BATCH] Warning: failed to write metrics_batch.tsv: {exc}\n"
+        if log_file is not None:
+            log_file.write(msg)
+        write_paper_phase1_log(msg, log_file=None)
 
 
 def write_paper_metrics_snapshot(
@@ -1510,9 +1796,16 @@ def write_paper_metrics_snapshot(
             "future_blocks": int(metrics.get("cache_future_prefetch_blocks", 0)),
             "future_skipped": int(metrics.get("cache_future_prefetch_skipped", 0)),
             "future_reserved": int(metrics.get("future_prefetch_reserved", 0)),
+            "urgent_storage_read_calls": int(metrics.get("urgent_storage_read_calls", 0)),
+            "urgent_storage_read_blocks": int(metrics.get("urgent_storage_read_blocks", 0)),
+            "urgent_storage_read_time_ms": float(metrics.get("urgent_storage_read_time_ms", 0.0)),
+            "future_storage_read_calls": int(metrics.get("future_storage_read_calls", 0)),
+            "future_storage_read_blocks": int(metrics.get("future_storage_read_blocks", 0)),
+            "future_storage_read_time_ms": float(metrics.get("future_storage_read_time_ms", 0.0)),
             "inflight_wait_blocks": int(metrics.get("inflight_wait_blocks", 0)),
             "inflight_fallback_blocks": int(metrics.get("inflight_fallback_blocks", 0)),
             "inflight_wait_time_ms": float(metrics.get("inflight_wait_time_ms", 0.0)),
+            "bytes_per_block": int(metrics.get("bytes_per_block", 0)),
             "cache_size": int(metrics.get("cache_size", 0)),
             "dirty_blocks": int(metrics.get("dirty_blocks", 0)),
             "flushing_blocks": int(metrics.get("flushing_blocks", 0)),

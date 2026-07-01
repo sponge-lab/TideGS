@@ -158,6 +158,7 @@ from strategies.tide_engine.runtime import (
     log_paper_gpu_working_set_parameters as _log_paper_gpu_working_set_parameters,
     log_paper_perf_profile as _log_paper_perf_profile,
     log_paper_warm_layer_metrics as _log_paper_warm_layer_metrics,
+    write_paper_metrics_batch as _write_paper_metrics_batch,
     log_ssd_stage1_debug as _log_ssd_stage1_debug,
     log_early_delta_hint as _log_early_delta_hint,
     log_paper_cpu_source_refs_restored as _log_paper_cpu_source_refs_restored,
@@ -1284,6 +1285,11 @@ def clm_offload_train_one_batch(
                         preserve_resident_metadata=used_paper_prefetch_buffer,
                     )
                     actual_current_resident_blocks = list(gaussians.gpu_working_set_manager.loaded_blocks)
+                    _paper_stage_metrics['resident_policy'] = str(getattr(args, "paper_resident_selection_policy", "passthrough_active_set"))
+                    _paper_stage_metrics['resident_capacity'] = args.paper_resident_capacity_blocks
+                    _paper_stage_metrics['r_t_size_unrestricted'] = len(actual_current_resident_blocks)
+                    _paper_stage_metrics['r_t_size'] = len(actual_current_resident_blocks)
+                    _paper_stage_metrics['k_t_size'] = len(visible_block_ids)
                     paper_block_sets = _compute_paper_block_sets(
                         storage_adapter=storage_adapter,
                         training_schedule=training_schedule,
@@ -3234,6 +3240,16 @@ def clm_offload_train_one_batch(
     
     # [PERF PROFILE] Print stage timings
     _ts('iter_end')
+    if is_paper_ssd_mode:
+        _write_paper_metrics_batch(
+            iteration=iteration,
+            perf_times=_perf_t,
+            storage_adapter=storage_adapter,
+            model_path=getattr(args, "model_path", ""),
+            batch_size=bsz,
+            paper_stage_metrics=_paper_stage_metrics,
+            log_file=log_file,
+        )
     if _perf_log:
         if is_paper_ssd_mode:
             _log_paper_perf_profile(

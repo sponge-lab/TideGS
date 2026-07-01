@@ -235,8 +235,12 @@ append_train_command() {
     printf '  -s %q \\\n' "${SRC}"
     printf '  --model_path %q \\\n' "${model_path}"
     printf '  --iterations %q \\\n' "${iterations}"
-    for arg in "${checkpoint_args[@]}"; do printf '  %q \\\n' "${arg}"; done
-    for arg in "${resume_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ ${#checkpoint_args[@]} -gt 0 ]]; then
+      for arg in "${checkpoint_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    fi
+    if [[ ${#resume_args[@]} -gt 0 ]]; then
+      for arg in "${resume_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    fi
     printf '  --dense_ply_file %q \\\n' "${PLY}"
     if [[ -n "${DECODE_DATASET_PATH}" ]]; then
       printf '  --decode_dataset_path %q \\\n' "${DECODE_DATASET_PATH}"
@@ -245,6 +249,7 @@ append_train_command() {
     printf '  --debug_max_train_cameras %q \\\n' "${DEBUG_MAX_TRAIN_CAMERAS}"
     printf '  --debug_camera_sample_mode %q \\\n' "${DEBUG_CAMERA_SAMPLE_MODE}"
     printf '  --debug_camera_sample_start %q \\\n' "${DEBUG_CAMERA_SAMPLE_START}"
+    printf '  --debug_fast_init_scales \\\n'
     printf '  --disable_auto_densification \\\n'
     printf '  --sparse_adam \\\n'
     printf '  --enable_timer \\\n'
@@ -254,7 +259,9 @@ append_train_command() {
     printf '  --use_ssd_offload \\\n'
     printf '  --pure_ssd_offload \\\n'
     printf '  --pure_ssd_init_backend streaming \\\n'
-    for arg in "${prebuilt_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ ${#prebuilt_args[@]} -gt 0 ]]; then
+      for arg in "${prebuilt_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    fi
     printf '  --use_6plane \\\n'
     printf '  --ssd_cache_dir %q \\\n' "${cache_dir}"
     printf '  --gaussian_block_size 4096 \\\n'
