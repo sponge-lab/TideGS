@@ -19,7 +19,7 @@ This eliminates the CPU→GPU transfer latency from the critical path.
 
 import torch
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
 import time
 
@@ -541,6 +541,69 @@ class DoubleBufferGPUWorkingSet:
                 refreshed += 1
 
             if refreshed > 0:
+                self.prefetch_complete_event.record(self.prefetch_stream)
+
+        return refreshed
+
+    def refresh_blocks_from_active_buffer(
+        self,
+        block_ids: List[int],
+        target: str = 'loading',
+    ) -> Set[int]:
+        """
+        Refresh selected blocks in-place from the active GPU buffer.
+
+        Paper mode launches N+1 prefetch before the optimizer step, so kept
+        Omega blocks in the loading buffer may contain pre-optimizer values.
+        After writeback, updated Omega blocks can be repaired directly from the
+        active buffer without routing through the CPU cache.
+        """
+        source_buffer = self.active_buffer
+        target_buffer = self.loading_buffer if target == 'loading' else self.active_buffer
+        refreshed: Set[int] = set()
+
+        if (
+            source_buffer.is_empty()
+            or target_buffer.is_empty()
+            or not block_ids
+            or source_buffer.block_to_local_slice is None
+            or target_buffer.block_to_local_slice is None
+        ):
+            return refreshed
+
+        components = (
+            ("xyz", source_buffer.xyz, target_buffer.xyz),
+            ("scaling", source_buffer.scaling, target_buffer.scaling),
+            ("rotation", source_buffer.rotation, target_buffer.rotation),
+            ("opacity", source_buffer.opacity, target_buffer.opacity),
+            ("features_dc", source_buffer.features_dc, target_buffer.features_dc),
+            ("features_rest", source_buffer.features_rest, target_buffer.features_rest),
+        )
+        if any(source is None or target_tensor is None for _, source, target_tensor in components):
+            return refreshed
+
+        self.prefetch_stream.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(self.prefetch_stream), torch.no_grad():
+            for raw_block_id in block_ids:
+                block_id = int(raw_block_id)
+                source_slice = source_buffer.block_to_local_slice.get(block_id)
+                target_slice = target_buffer.block_to_local_slice.get(block_id)
+                if source_slice is None or target_slice is None:
+                    continue
+
+                source_len = source_slice.stop - source_slice.start
+                target_len = target_slice.stop - target_slice.start
+                refresh_len = min(source_len, target_len)
+                if refresh_len <= 0:
+                    continue
+
+                src = slice(source_slice.start, source_slice.start + refresh_len)
+                dst = slice(target_slice.start, target_slice.start + refresh_len)
+                for _, source, target_tensor in components:
+                    target_tensor[dst] = source[src].detach()
+                refreshed.add(block_id)
+
+            if refreshed:
                 self.prefetch_complete_event.record(self.prefetch_stream)
 
         return refreshed

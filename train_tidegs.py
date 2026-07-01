@@ -230,8 +230,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         log_file.write(f"[SSD] Execution mode: {args.ssd_execution_mode}\n")
 
         ssd_schedule_ordering = getattr(args, "ssd_schedule_ordering", "trajectory")
-        ssd_schedule_shuffle = ssd_schedule_ordering == "shuffle"
-        ssd_training_schedule = storage_adapter.get_training_schedule(shuffle=ssd_schedule_shuffle)
+        ssd_training_schedule = storage_adapter.get_training_schedule(
+            schedule_ordering=ssd_schedule_ordering
+        )
         utils.print_rank_0(f"[SSD] Schedule ordering: {ssd_schedule_ordering}")
         log_file.write(f"[SSD] Schedule ordering: {ssd_schedule_ordering}\n")
 

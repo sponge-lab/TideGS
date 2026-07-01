@@ -41,6 +41,7 @@ RESIDENT_DECAY_LIST="0.95"
 BALANCED_SEED_FRACTION_LIST="0.25"
 BSZ_LIST="16"
 CAPACITY_LIST="2048"
+SCHEDULE_ORDERING="trajectory"
 CHECKPOINT_ITER=500
 RESUME_TO_ITER=1000
 START_CHECKPOINT=""
@@ -73,6 +74,7 @@ Options:
   --capacity N                Single resident block capacity for release runs
   --bsz-list "LIST"           Batch sizes for sweeps (default: "${BSZ_LIST}")
   --capacity-list "LIST"      Resident block capacities for sweeps (default: "${CAPACITY_LIST}")
+  --schedule-ordering MODE   trajectory|shuffle|random (default: ${SCHEDULE_ORDERING})
   --projection-chunk N        projection_max_cameras_per_chunk (default: ${PROJECTION_CHUNK})
   --max-ram-gb N              RAM cache budget (default: ${MAX_RAM_GB})
   --checkpoint-mode MODE      incremental|snapshot (default: ${CHECKPOINT_MODE})
@@ -137,6 +139,7 @@ while [[ $# -gt 0 ]]; do
     --balanced-seed-fraction) BALANCED_SEED_FRACTION_LIST="$2"; shift 2 ;;
     --balanced-seed-fraction-list) BALANCED_SEED_FRACTION_LIST="$2"; shift 2 ;;
     --checkpoint-iter) CHECKPOINT_ITER="$2"; shift 2 ;;
+    --schedule-ordering) SCHEDULE_ORDERING="$2"; shift 2 ;;
     --resume-to-iter) RESUME_TO_ITER="$2"; shift 2 ;;
     --start-checkpoint) START_CHECKPOINT="$2"; shift 2 ;;
     --debug-logging) DEBUG_LOGGING=1; shift ;;
@@ -232,8 +235,12 @@ append_train_command() {
     printf '  -s %q \\\n' "${SRC}"
     printf '  --model_path %q \\\n' "${model_path}"
     printf '  --iterations %q \\\n' "${iterations}"
-    for arg in "${checkpoint_args[@]}"; do printf '  %q \\\n' "${arg}"; done
-    for arg in "${resume_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ ${#checkpoint_args[@]} -gt 0 ]]; then
+      for arg in "${checkpoint_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    fi
+    if [[ ${#resume_args[@]} -gt 0 ]]; then
+      for arg in "${resume_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    fi
     printf '  --dense_ply_file %q \\\n' "${PLY}"
     if [[ -n "${DECODE_DATASET_PATH}" ]]; then
       printf '  --decode_dataset_path %q \\\n' "${DECODE_DATASET_PATH}"
@@ -242,6 +249,7 @@ append_train_command() {
     printf '  --debug_max_train_cameras %q \\\n' "${DEBUG_MAX_TRAIN_CAMERAS}"
     printf '  --debug_camera_sample_mode %q \\\n' "${DEBUG_CAMERA_SAMPLE_MODE}"
     printf '  --debug_camera_sample_start %q \\\n' "${DEBUG_CAMERA_SAMPLE_START}"
+    printf '  --debug_fast_init_scales \\\n'
     printf '  --disable_auto_densification \\\n'
     printf '  --sparse_adam \\\n'
     printf '  --enable_timer \\\n'
@@ -251,7 +259,9 @@ append_train_command() {
     printf '  --use_ssd_offload \\\n'
     printf '  --pure_ssd_offload \\\n'
     printf '  --pure_ssd_init_backend streaming \\\n'
-    for arg in "${prebuilt_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    if [[ ${#prebuilt_args[@]} -gt 0 ]]; then
+      for arg in "${prebuilt_args[@]}"; do printf '  %q \\\n' "${arg}"; done
+    fi
     printf '  --use_6plane \\\n'
     printf '  --ssd_cache_dir %q \\\n' "${cache_dir}"
     printf '  --gaussian_block_size 4096 \\\n'
@@ -274,6 +284,7 @@ append_train_command() {
     if [[ "${VERBOSE_TERMINAL}" != "1" ]]; then
       printf '  --quiet \\\n'
     fi
+    printf '  --ssd_schedule_ordering %q \\\n' "${SCHEDULE_ORDERING}"
     printf '  --tide_free_unified_params \\\n'
     printf '  --pure_ssd_schedule_cache_dir %q\n' "${SCHED_CACHE}"
   } >> "${COMMANDS}"

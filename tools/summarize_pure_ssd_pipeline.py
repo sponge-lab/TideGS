@@ -10,7 +10,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 
 FIELDS = [
@@ -49,6 +49,28 @@ FIELDS = [
     "future_prefetch_jobs",
     "future_prefetch_blocks",
     "future_prefetch_time_s",
+    "stage1_5a_cull_time_s",
+    "stage1_5b_ab_check_time_s",
+    "stage1_5c_resident_time_s",
+    "stage1_5d_ssd_load_time_s",
+    "stage1_5e_delta_time_s",
+    "stage1_5f_hint_time_s",
+    "stage1_5g_ab_prefetch_time_s",
+    "ssd_bytes_read_urgent_gb",
+    "ssd_bytes_read_future_gb",
+    "peak_future_read_blocks",
+    "peak_future_read_mb",
+    "peak_future_read_blocks_vs_rt",
+    "peak_future_read_blocks_vs_cap",
+    "peak_future_read_batch_idx",
+    "peak_delta_plus",
+    "peak_cap_transfer_share_at_3p3gibs",
+    "avg_future_storage_read_time_ms",
+    "avg_future_storage_read_share_pct",
+    "avg_future_storage_read_bw_mb_s",
+    "peak_future_storage_read_time_ms",
+    "ab_prefetch_hit_count",
+    "ab_prefetch_miss_count",
     "dirty_blocks_before_shutdown",
     "dirty_blocks_after_shutdown",
     "sync_flush_blocks",
@@ -95,6 +117,114 @@ FIELDS = [
     "errors",
 ]
 
+METRICS_SNAPSHOT_NAME = "metrics_snapshot.tsv"
+METRICS_WINDOW_NAME = "metrics_window.tsv"
+METRICS_BATCH_NAME = "metrics_batch.tsv"
+
+METRICS_WINDOW_FIELDS = [
+    "sample_idx",
+    "batch_idx",
+    "iteration",
+    "iter_end",
+    "bsz",
+    "window_batches",
+    "delta_cache_hits",
+    "delta_cache_misses",
+    "window_hit_rate",
+    "delta_prefetches",
+    "delta_ssd_read_urgent_mb",
+    "delta_ssd_read_future_mb",
+    "delta_ssd_write_async_mb",
+    "delta_ssd_write_sync_mb",
+    "delta_urgent_blocks",
+    "delta_urgent_misses",
+    "delta_future_submitted",
+    "delta_future_blocks",
+    "delta_future_skipped",
+    "delta_future_reserved",
+    "delta_urgent_storage_read_calls",
+    "delta_urgent_storage_read_blocks",
+    "delta_urgent_storage_read_time_ms",
+    "delta_future_storage_read_calls",
+    "delta_future_storage_read_blocks",
+    "delta_future_storage_read_time_ms",
+    "delta_inflight_wait_blocks",
+    "delta_inflight_fallback_blocks",
+    "delta_inflight_wait_time_ms",
+    "cache_size",
+    "dirty_blocks",
+    "flushing_blocks",
+    "flush_q",
+    "future_pending",
+    "ram_usage_mb",
+    "setup_ms",
+    "ssd_cull_load_ms",
+    "gauss_cull_legacy_ms",
+    "n1_prefetch_ms",
+    "gauss_cull_excl_n1_ms",
+    "train_ms",
+    "optim_ms",
+    "writeback_ms",
+    "total_ms",
+]
+
+METRICS_COUNTER_FIELDS = [
+    "cache_hits",
+    "cache_misses",
+    "prefetches",
+    "urgent_blocks",
+    "urgent_misses",
+    "future_submitted",
+    "future_blocks",
+    "future_skipped",
+    "future_reserved",
+    "urgent_storage_read_calls",
+    "urgent_storage_read_blocks",
+    "urgent_storage_read_time_ms",
+    "future_storage_read_calls",
+    "future_storage_read_blocks",
+    "future_storage_read_time_ms",
+    "inflight_wait_blocks",
+    "inflight_fallback_blocks",
+    "inflight_wait_time_ms",
+]
+
+METRICS_BYTE_COUNTER_FIELDS = [
+    "ssd_bytes_read_urgent",
+    "ssd_bytes_read_future",
+    "ssd_bytes_written_async",
+    "ssd_bytes_written_sync",
+]
+
+METRICS_BYTE_OUTPUT_FIELDS = {
+    "ssd_bytes_read_urgent": "delta_ssd_read_urgent_mb",
+    "ssd_bytes_read_future": "delta_ssd_read_future_mb",
+    "ssd_bytes_written_async": "delta_ssd_write_async_mb",
+    "ssd_bytes_written_sync": "delta_ssd_write_sync_mb",
+}
+
+METRICS_GAUGE_FIELDS = [
+    "cache_size",
+    "dirty_blocks",
+    "flushing_blocks",
+    "flush_q",
+    "future_pending",
+    "bytes_per_block",
+    "ram_usage_mb",
+]
+
+METRICS_STAGE_TIME_FIELDS = [
+    "setup_ms",
+    "ssd_cull_load_ms",
+    "gauss_cull_legacy_ms",
+    "n1_prefetch_ms",
+    "gauss_cull_excl_n1_ms",
+    "train_ms",
+    "optim_ms",
+    "writeback_ms",
+    "total_ms",
+]
+
 
 PATTERNS = {
     "pure_check": re.compile(
@@ -117,6 +247,15 @@ PATTERNS = {
     "kt_metrics": re.compile(r"\[PAPER K_T METRICS\].*"),
     "end2end": re.compile(r"end2end total_time: ([0-9.]+) s, iterations: (\d+), throughput ([0-9.]+) it/s"),
     "kv": re.compile(r"([A-Za-z_]+)=([0-9.]+)"),
+    "stage_detail_time": re.compile(
+        r"stage\d\w+\s+:\s+([0-9.]+)ms"
+    ),
+    "stage_detail_hit": re.compile(
+        r"stage1_5b_ab_check\s+:\s+[0-9.]+ms\s+HIT"
+    ),
+    "stage_detail_miss": re.compile(
+        r"stage1_5b_ab_check\s+:\s+[0-9.]+ms\s+MISS"
+    ),
 }
 
 
@@ -379,6 +518,46 @@ def summarize_log(log_path: Path) -> Dict[str, object]:
                     summary["future_prefetch_blocks"] = values["future_blocks"]
                 if "future_time" in values:
                     summary["future_prefetch_time_s"] = float(values["future_time"]) / 1000.0
+                if "ssd_urgent_mb" in values:
+                    summary["ssd_bytes_read_urgent_gb"] = _as_gb_mb(values["ssd_urgent_mb"])
+                if "ssd_future_mb" in values:
+                    summary["ssd_bytes_read_future_gb"] = _as_gb_mb(values["ssd_future_mb"])
+            elif "[PAPER STAGE DETAIL]" in line:
+                # Parse multi-line stage detail block — each sub-line starts with "  stage"
+                # We accumulate the LAST value for each stage (final state of counters)
+                pass  # handled by the line-by-line parsing below
+            elif line.startswith("  stage1_5a_cull"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5a_cull_time_s"] = float(summary["stage1_5a_cull_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5b_ab_check"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5b_ab_check_time_s"] = float(summary["stage1_5b_ab_check_time_s"] or 0) + float(m.group(1)) / 1000.0
+                if PATTERNS["stage_detail_hit"].search(line):
+                    summary["ab_prefetch_hit_count"] = int(summary["ab_prefetch_hit_count"] or 0) + 1
+                elif PATTERNS["stage_detail_miss"].search(line):
+                    summary["ab_prefetch_miss_count"] = int(summary["ab_prefetch_miss_count"] or 0) + 1
+            elif line.startswith("  stage1_5c_resident") and "(skipped" not in line:
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5c_resident_time_s"] = float(summary["stage1_5c_resident_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5d_ssd_load") and "(skipped" not in line:
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5d_ssd_load_time_s"] = float(summary["stage1_5d_ssd_load_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5e_delta"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5e_delta_time_s"] = float(summary["stage1_5e_delta_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5f_hint"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5f_hint_time_s"] = float(summary["stage1_5f_hint_time_s"] or 0) + float(m.group(1)) / 1000.0
+            elif line.startswith("  stage1_5g_ab_prefetch"):
+                m = PATTERNS["stage_detail_time"].search(line)
+                if m:
+                    summary["stage1_5g_ab_prefetch_time_s"] = float(summary["stage1_5g_ab_prefetch_time_s"] or 0) + float(m.group(1)) / 1000.0
             elif "[LogStorage] Created patch" in line:
                 match = PATTERNS["patch"].search(line)
                 if match:
@@ -461,6 +640,8 @@ def summarize_log(log_path: Path) -> Dict[str, object]:
         )
         summary["kt_resident_coverage_min"] = min(kt_resident_coverage_values)
 
+    update_metrics_batch_peak_summary(log_path.parent, summary)
+
     summary["status"] = "ok" if summary["training_complete"] and int(summary["errors"]) == 0 else "failed"
     gpu_peak = _float_or_none(summary.get("gpu_peak_gb"))
     ram_cache = _float_or_none(summary.get("ram_cache_gb"))
@@ -527,6 +708,150 @@ def write_tsv(rows: List[Dict[str, object]], output: Path | None) -> None:
         writer.writerows(rows)
 
 
+def _metric_number(row: Dict[str, Any] | None, key: str, default: float = 0.0) -> float:
+    if row is None:
+        return default
+    value = row.get(key, "")
+    if value in ("", None):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metric_delta(cur: Dict[str, Any], prev: Dict[str, Any] | None, key: str) -> float:
+    if prev is None:
+        return 0.0
+    return _metric_number(cur, key) - _metric_number(prev, key)
+
+
+def update_metrics_batch_peak_summary(run_dir: Path, summary: Dict[str, object]) -> None:
+    batch_path = run_dir / METRICS_BATCH_NAME
+    if not batch_path.is_file():
+        return
+    with open(batch_path, "r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    if not rows:
+        return
+
+    non_reset = [row for row in rows if int(_metric_number(row, "reset")) == 0]
+    candidates = non_reset or rows
+    peak = max(candidates, key=lambda row: _metric_number(row, "future_read_blocks_delta"))
+    summary["peak_future_read_blocks"] = _metric_number(peak, "future_read_blocks_delta")
+    summary["peak_future_read_mb"] = _metric_number(peak, "future_read_mb_delta")
+    summary["peak_future_read_blocks_vs_rt"] = _metric_number(peak, "future_read_blocks_vs_rt")
+    summary["peak_future_read_blocks_vs_cap"] = (
+        _metric_number(peak, "future_read_blocks_vs_cap")
+        or _metric_number(peak, "future_read_blocks_vs_rt")
+    )
+    summary["peak_future_read_batch_idx"] = _metric_index_value(peak, "batch_idx")
+    summary["peak_delta_plus"] = _metric_number(peak, "delta_plus")
+    summary["peak_cap_transfer_share_at_3p3gibs"] = _metric_number(peak, "cap_transfer_share_at_3p3gibs")
+
+    total_future_read_time_ms = sum(_metric_number(row, "future_storage_read_time_ms_delta") for row in candidates)
+    total_future_read_mb = sum(_metric_number(row, "future_read_mb_delta") for row in candidates)
+    total_ms = sum(_metric_number(row, "total_ms") for row in candidates)
+    summary["avg_future_storage_read_time_ms"] = total_future_read_time_ms / len(candidates) if candidates else ""
+    summary["avg_future_storage_read_share_pct"] = (
+        100.0 * total_future_read_time_ms / total_ms if total_ms > 0.0 else ""
+    )
+    summary["avg_future_storage_read_bw_mb_s"] = (
+        total_future_read_mb / (total_future_read_time_ms / 1000.0)
+        if total_future_read_time_ms > 0.0 else ""
+    )
+    summary["peak_future_storage_read_time_ms"] = max(
+        (_metric_number(row, "future_storage_read_time_ms_delta") for row in candidates),
+        default=0.0,
+    )
+
+
+def _metrics_window_reset(cur: Dict[str, Any], prev: Dict[str, Any] | None) -> bool:
+    if prev is None:
+        return False
+    if _metric_number(cur, "batch_idx") <= _metric_number(prev, "batch_idx"):
+        return True
+    for key in METRICS_COUNTER_FIELDS + METRICS_BYTE_COUNTER_FIELDS:
+        if _metric_number(cur, key) < _metric_number(prev, key):
+            return True
+    return False
+
+
+def _metric_index_value(row: Dict[str, Any], key: str) -> int | str:
+    value = row.get(key, "")
+    if value in ("", None):
+        return ""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return value
+
+
+def derive_metrics_window_rows(snapshot_rows: List[Dict[str, Any]]) -> List[Dict[str, object]]:
+    window_rows: List[Dict[str, object]] = []
+    prev: Dict[str, Any] | None = None
+    for cur in snapshot_rows:
+        delta_base = None if _metrics_window_reset(cur, prev) else prev
+        delta_hits = _metric_delta(cur, delta_base, "cache_hits")
+        delta_misses = _metric_delta(cur, delta_base, "cache_misses")
+        total_lookups = delta_hits + delta_misses
+        batch_idx = _metric_number(cur, "batch_idx")
+        prev_batch_idx = _metric_number(delta_base, "batch_idx") if delta_base is not None else batch_idx
+
+        row: Dict[str, object] = {
+            "sample_idx": _metric_index_value(cur, "sample_idx"),
+            "batch_idx": _metric_index_value(cur, "batch_idx"),
+            "iteration": _metric_index_value(cur, "iteration"),
+            "iter_end": _metric_index_value(cur, "iter_end"),
+            "bsz": _metric_index_value(cur, "bsz"),
+            "window_batches": batch_idx - prev_batch_idx if prev is not None else 0.0,
+            "delta_cache_hits": delta_hits,
+            "delta_cache_misses": delta_misses,
+            "window_hit_rate": (delta_hits / total_lookups) if total_lookups > 0 else "",
+        }
+
+        for field in METRICS_COUNTER_FIELDS:
+            if field in ("cache_hits", "cache_misses"):
+                continue
+            row[f"delta_{field}"] = _metric_delta(cur, delta_base, field)
+
+        for field in METRICS_BYTE_COUNTER_FIELDS:
+            row[METRICS_BYTE_OUTPUT_FIELDS[field]] = _metric_delta(cur, delta_base, field) / (1024 * 1024)
+
+        for field in METRICS_GAUGE_FIELDS:
+            row[field] = _metric_number(cur, field)
+
+        for field in METRICS_STAGE_TIME_FIELDS:
+            row[field] = _metric_number(cur, field)
+
+        window_rows.append(row)
+        prev = cur
+    return window_rows
+
+
+def read_metrics_snapshot(snapshot_path: Path) -> List[Dict[str, str]]:
+    with open(snapshot_path, "r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def write_metrics_window_tsv(run_dir: Path) -> bool:
+    snapshot_path = run_dir / METRICS_SNAPSHOT_NAME
+    if not snapshot_path.is_file():
+        return False
+    rows = derive_metrics_window_rows(read_metrics_snapshot(snapshot_path))
+    output_path = run_dir / METRICS_WINDOW_NAME
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=METRICS_WINDOW_FIELDS,
+            delimiter="\t",
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", help="Run directories or python.log files")
@@ -541,7 +866,14 @@ def main() -> None:
     logs = resolve_logs(args.paths)
     if not logs:
         raise SystemExit("No python.log files found")
-    rows = [summarize_log(log) for log in logs]
+    rows = []
+    for log in logs:
+        rows.append(summarize_log(log))
+        run_dir = log.parent if log.name == "python.log" else log
+        try:
+            write_metrics_window_tsv(run_dir)
+        except Exception as exc:
+            print(f"warning: failed to write {run_dir / METRICS_WINDOW_NAME}: {exc}", file=sys.stderr)
     recommended_rows = rank_recommendations(rows)
     write_tsv(rows, Path(args.output) if args.output else None)
     if args.recommend_output:

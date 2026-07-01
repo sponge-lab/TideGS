@@ -191,6 +191,7 @@ class AuxiliaryParams(ParamGroup):
         self.visualize_ssd_schedule = False  # Generate TSP schedule visualization
         self.pure_ssd_schedule_cache_dir = ""  # Optional persistent cache for pure SSD camera TSP schedules
         self.pure_ssd_disable_schedule_cache = False  # Disable pure SSD camera schedule cache
+        self.ssd_schedule_ordering = "trajectory"  # {trajectory, shuffle, random}; camera visitation order
         self.enable_hotspot_retention = True  # Enable GPU hotspot retention to reduce RAM→GPU bandwidth
         self.ssd_execution_mode = "fast_ram"  # {fast_ram, paper}; TideGS routes reads through the SSD→RAM cache path
         self.paper_optimizer_deferred_mode = "off"  # {off, same_iter, cross_iter}; optimizer/writeback defer mode

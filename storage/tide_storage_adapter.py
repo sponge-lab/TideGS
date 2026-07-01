@@ -60,6 +60,13 @@ class TideStorageAdapter:
         self.paper_debug_logging = bool(
             getattr(getattr(self.gaussians, "args", None), "paper_debug_logging", False)
         )
+        self.schedule_ordering = str(
+            getattr(
+                getattr(self.gaussians, "args", None),
+                "ssd_schedule_ordering",
+                "trajectory",
+            )
+        ).lower()
         self.schedule_cache_enabled = not bool(
             getattr(getattr(self.gaussians, "args", None), "pure_ssd_disable_schedule_cache", False)
         )
@@ -263,6 +270,13 @@ class TideStorageAdapter:
         )
 
     def _initialize_cameras(self) -> None:
+        if self.schedule_ordering == "random":
+            self._log("[TideStorageAdapter] Skipping camera scheduling (random ordering)")
+            self.camera_clusters = None
+            self.scheduler = None
+            self._cached_training_schedule = None
+            return
+
         self._log("[TideStorageAdapter] Building camera schedule")
         camera_positions = []
         camera_directions = []
@@ -405,23 +419,31 @@ class TideStorageAdapter:
         )
         self.pipeline.start()
 
-    def get_training_schedule(self, shuffle: bool = False, repeat_epochs: int = 1) -> List[int]:
-        if getattr(self, "_cached_training_schedule", None) is not None:
+    def get_training_schedule(
+        self, schedule_ordering: str = "trajectory", repeat_epochs: int = 1
+    ) -> List[int]:
+        import random
+
+        if schedule_ordering == "random":
+            schedule = list(range(len(self.cameras)))
+            random.shuffle(schedule)
+        elif getattr(self, "_cached_training_schedule", None) is not None:
             schedule = list(self._cached_training_schedule)
         else:
             schedule = self.scheduler.get_tsp_camera_order()
             self._save_camera_schedule_cache(schedule)
-        if shuffle:
-            import random
 
-            print("[WARNING] Shuffling enabled in SSD schedule - this will reduce cache hit rates")
+        if schedule_ordering == "shuffle":
+            print(
+                "[WARNING] Shuffling enabled in SSD schedule - this will reduce cache hit rates"
+            )
             random.shuffle(schedule)
         if repeat_epochs > 1:
             schedule = schedule * repeat_epochs
 
         self._log(
             f"[SSD Schedule] Generated {len(schedule)} camera indices "
-            f"(TSP order, {self.num_clusters} clusters, shuffle={shuffle})"
+            f"(ordering={schedule_ordering}, clusters={self.num_clusters})"
         )
         return schedule
 

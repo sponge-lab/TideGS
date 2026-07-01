@@ -734,10 +734,26 @@ def snapshot_paper_warm_layer_metrics(storage_adapter) -> Optional[Dict[str, flo
             "cache_future_prefetch_blocks": int(cache_stats.get("future_prefetch_blocks", 0)),
             "cache_future_prefetch_time_ms": float(cache_stats.get("future_prefetch_time", 0.0) * 1000.0),
             "cache_future_prefetch_errors": int(cache_stats.get("future_prefetch_errors", 0)),
+            "urgent_storage_read_calls": int(cache_stats.get("urgent_storage_read_calls", 0)),
+            "urgent_storage_read_blocks": int(cache_stats.get("urgent_storage_read_blocks", 0)),
+            "urgent_storage_read_time_ms": float(cache_stats.get("urgent_storage_read_time", 0.0) * 1000.0),
+            "future_storage_read_calls": int(cache_stats.get("future_storage_read_calls", 0)),
+            "future_storage_read_blocks": int(cache_stats.get("future_storage_read_blocks", 0)),
+            "future_storage_read_time_ms": float(cache_stats.get("future_storage_read_time", 0.0) * 1000.0),
             "cache_future_queue": int(cache_stats.get("future_prefetch_queue_size", cache_stats.get("future_queue_size", 0))),
             "cache_future_pending": int(cache_stats.get("future_prefetch_pending", cache_stats.get("future_pending_blocks", 0))),
+            "future_prefetch_reserved": int(cache_stats.get("future_prefetch_reserved", 0)),
+            "inflight_wait_blocks": int(cache_stats.get("inflight_wait_blocks", 0)),
+            "inflight_wait_time_ms": float(cache_stats.get("inflight_wait_time", 0.0) * 1000.0),
+            "inflight_fallback_blocks": int(cache_stats.get("inflight_fallback_blocks", 0)),
             "ram_usage_mb": float(cache_stats.get("ram_usage_mb", 0.0)),
             "max_ram_mb": float(cache_stats.get("max_ram_mb", 0.0)),
+            "ssd_bytes_read_urgent": int(cache_stats.get("ssd_bytes_read_urgent", 0)),
+            "ssd_bytes_read_future": int(cache_stats.get("ssd_bytes_read_future", 0)),
+            "ssd_bytes_written_async": int(cache_stats.get("ssd_bytes_written_async", 0)),
+            "ssd_bytes_written_sync": int(cache_stats.get("ssd_bytes_written_sync", 0)),
+            "bytes_per_block": int(cache_stats.get("bytes_per_block", 0)),
+            "async_flush_jobs": int(cache_stats.get("async_flush_jobs", 0)),
         })
 
     return metrics
@@ -799,7 +815,13 @@ def log_paper_warm_layer_metrics(storage_adapter, iteration: int, stage: str, lo
         f"future_time={metrics.get('cache_future_prefetch_time_ms', 0.0):.1f}ms "
         f"future_q={metrics.get('cache_future_queue', 0)} "
         f"future_pending={metrics.get('cache_future_pending', 0)} "
-        f"future_errors={metrics.get('cache_future_prefetch_errors', 0)}\n",
+        f"future_errors={metrics.get('cache_future_prefetch_errors', 0)} "
+        f"ssd_urgent_mb={metrics.get('ssd_bytes_read_urgent', 0) / (1024*1024):.1f} "
+        f"ssd_future_mb={metrics.get('ssd_bytes_read_future', 0) / (1024*1024):.1f} "
+        f"future_reserved={metrics.get('future_prefetch_reserved', 0)} "
+        f"inflight_wait={metrics.get('inflight_wait_blocks', 0)} "
+        f"inflight_wait_time={metrics.get('inflight_wait_time_ms', 0.0):.1f}ms "
+        f"inflight_fallback={metrics.get('inflight_fallback_blocks', 0)}\n",
         log_file=log_file,
     )
 
@@ -1314,28 +1336,43 @@ def apply_paper_writeback_payload(
 
     refreshed_omega = 0
     if len(omega_blocks) > 0:
-        omega_refresh_blocks = {
-            block_id: updated_blocks_dict[block_id]
-            for block_id in omega_blocks
-            if block_id in updated_blocks_dict
-        }
-        missing_omega_blocks = [
-            block_id for block_id in omega_blocks
-            if block_id not in omega_refresh_blocks
+        updated_block_set = set(int(block_id) for block_id in updated_blocks_dict.keys())
+        updated_omega_blocks = [
+            int(block_id) for block_id in omega_blocks
+            if int(block_id) in updated_block_set
         ]
-        if missing_omega_blocks:
-            omega_refresh_blocks.update(storage_adapter.cache.prefetch(missing_omega_blocks))
+        if updated_omega_blocks:
+            double_buffer = get_double_buffer_gpu_fn(
+                num_total=total_n_gaussians,
+                block_size=args.gaussian_block_size,
+                device="cuda",
+            )
 
-        double_buffer = get_double_buffer_gpu_fn(
-            num_total=total_n_gaussians,
-            block_size=args.gaussian_block_size,
-            device="cuda",
-        )
-        refreshed_omega = double_buffer.refresh_blocks_from_block_cache(
-            block_cache=omega_refresh_blocks,
-            block_ids=omega_blocks,
-            target="loading",
-        )
+            gpu_refreshed_blocks = set()
+            refresh_from_active = getattr(double_buffer, "refresh_blocks_from_active_buffer", None)
+            if callable(refresh_from_active):
+                gpu_refreshed_blocks = set(
+                    int(block_id)
+                    for block_id in (refresh_from_active(updated_omega_blocks, target="loading") or set())
+                )
+
+            cpu_refresh_blocks = [
+                block_id for block_id in updated_omega_blocks
+                if block_id not in gpu_refreshed_blocks
+            ]
+            if cpu_refresh_blocks:
+                omega_refresh_blocks = {
+                    block_id: updated_blocks_dict[block_id]
+                    for block_id in cpu_refresh_blocks
+                    if block_id in updated_blocks_dict
+                }
+                refreshed_omega += double_buffer.refresh_blocks_from_block_cache(
+                    block_cache=omega_refresh_blocks,
+                    block_ids=cpu_refresh_blocks,
+                    target="loading",
+                )
+
+            refreshed_omega += len(gpu_refreshed_blocks)
 
     return staged_writeback_blocks, refreshed_omega, len(updated_block_ids)
 
@@ -1374,32 +1411,641 @@ def collect_paper_updated_block_ids(
     )
 
 
+def _calc_stage_time_ms(perf_times: Dict[str, float], start: str, end: str) -> float:
+    """Compute elapsed ms between two _ts() timestamps."""
+    iter_start = perf_times.get("iter_start", 0.0)
+    return (perf_times.get(end, iter_start) - perf_times.get(start, iter_start)) * 1000.0
+
+
+METRICS_SNAPSHOT_FIELDS = [
+    "sample_idx",
+    "batch_idx",
+    "iteration",
+    "iter_end",
+    "bsz",
+    "cache_hits",
+    "cache_misses",
+    "prefetches",
+    "hit_rate_cumulative",
+    "ssd_bytes_read_urgent",
+    "ssd_bytes_read_future",
+    "ssd_bytes_written_async",
+    "ssd_bytes_written_sync",
+    "urgent_blocks",
+    "urgent_misses",
+    "future_submitted",
+    "future_blocks",
+    "future_skipped",
+    "future_reserved",
+    "urgent_storage_read_calls",
+    "urgent_storage_read_blocks",
+    "urgent_storage_read_time_ms",
+    "future_storage_read_calls",
+    "future_storage_read_blocks",
+    "future_storage_read_time_ms",
+    "inflight_wait_blocks",
+    "inflight_fallback_blocks",
+    "inflight_wait_time_ms",
+    "bytes_per_block",
+    "cache_size",
+    "dirty_blocks",
+    "flushing_blocks",
+    "flush_q",
+    "future_pending",
+    "ram_usage_mb",
+    "setup_ms",
+    "ssd_cull_load_ms",
+    "gauss_cull_legacy_ms",
+    "n1_prefetch_ms",
+    "gauss_cull_excl_n1_ms",
+    "train_ms",
+    "optim_ms",
+    "writeback_ms",
+    "total_ms",
+]
+
+METRICS_BATCH_FIELDS = [
+    "sample_idx",
+    "batch_idx",
+    "iteration",
+    "iter_end",
+    "bsz",
+    "reset",
+    "resident_capacity",
+    "r_t_size",
+    "r_t_next_size",
+    "k_t_size",
+    "k_t_next_size",
+    "delta_plus",
+    "delta_minus",
+    "hint_requested",
+    "hint_submitted",
+    "future_read_blocks_delta",
+    "future_read_mb_delta",
+    "urgent_read_blocks_delta",
+    "urgent_read_mb_delta",
+    "future_storage_read_calls_delta",
+    "future_storage_read_blocks_delta",
+    "future_storage_read_time_ms_delta",
+    "future_storage_read_bw_mb_s",
+    "urgent_storage_read_calls_delta",
+    "urgent_storage_read_blocks_delta",
+    "urgent_storage_read_time_ms_delta",
+    "urgent_storage_read_bw_mb_s",
+    "future_reserved_delta",
+    "inflight_wait_blocks_delta",
+    "inflight_fallback_blocks_delta",
+    "inflight_wait_time_ms_delta",
+    "bytes_per_block",
+    "cap_read_mb",
+    "cap_transfer_ms_at_3p3gibs",
+    "cap_transfer_share_at_3p3gibs",
+    "cache_size",
+    "dirty_blocks",
+    "ram_usage_mb",
+    "setup_ms",
+    "ssd_cull_load_ms",
+    "n1_prefetch_ms",
+    "gauss_cull_excl_n1_ms",
+    "train_ms",
+    "optim_ms",
+    "writeback_ms",
+    "total_ms",
+    "future_read_blocks_vs_rt",
+    "future_read_blocks_vs_cap",
+]
+
+_metrics_snapshot_counts: Dict[str, int] = {}
+_metrics_batch_prev: Dict[str, Dict[str, Any]] = {}
+
+
+def _format_tsv_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
+def _next_metrics_sample_idx(snapshot_path: str) -> int:
+    key = os.path.abspath(snapshot_path)
+    if key not in _metrics_snapshot_counts:
+        count = 0
+        if os.path.exists(snapshot_path):
+            with open(snapshot_path, "r", encoding="utf-8", errors="replace") as handle:
+                count = max(0, sum(1 for _ in handle) - 1)
+        _metrics_snapshot_counts[key] = count
+    sample_idx = _metrics_snapshot_counts[key]
+    _metrics_snapshot_counts[key] = sample_idx + 1
+    return sample_idx
+
+
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    if value in ("", None):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float_value(value: Any, default: float = 0.0) -> float:
+    if value in ("", None):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metrics_batch_reset(cur: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> bool:
+    if prev is None:
+        return True
+    if _safe_int_value(cur.get("batch_idx")) <= _safe_int_value(prev.get("batch_idx")):
+        return True
+    counter_fields = (
+        "future_blocks",
+        "urgent_blocks",
+        "ssd_bytes_read_future",
+        "ssd_bytes_read_urgent",
+        "future_storage_read_calls",
+        "future_storage_read_blocks",
+        "future_storage_read_time_ms",
+        "urgent_storage_read_calls",
+        "urgent_storage_read_blocks",
+        "urgent_storage_read_time_ms",
+        "future_reserved",
+        "inflight_wait_blocks",
+        "inflight_fallback_blocks",
+        "inflight_wait_time_ms",
+    )
+    return any(
+        _safe_float_value(cur.get(field)) < _safe_float_value(prev.get(field))
+        for field in counter_fields
+    )
+
+
+def _current_paper_resident_capacity() -> int:
+    try:
+        import utils.general_utils as utils
+
+        args = utils.get_args()
+        return _safe_int_value(
+            getattr(args, "paper_resident_capacity_blocks", None),
+            _safe_int_value(getattr(args, "tide_resident_capacity_blocks", None)),
+        )
+    except Exception:
+        return 0
+
+
+def write_paper_metrics_batch(
+    *,
+    iteration: int,
+    perf_times: Dict[str, float],
+    storage_adapter,
+    model_path: str,
+    batch_size: int,
+    paper_stage_metrics: Optional[Dict[str, Any]] = None,
+    log_file=None,
+) -> None:
+    if not model_path:
+        return
+
+    try:
+        bsz = max(1, int(batch_size or 1))
+        metrics = snapshot_paper_warm_layer_metrics(storage_adapter) or {}
+        stage_metrics = paper_stage_metrics or {}
+        batch_path = os.path.join(model_path, "metrics_batch.tsv")
+        os.makedirs(model_path, exist_ok=True)
+
+        batch_idx = (int(iteration) - 1) // bsz
+        n1_prefetch_ms = 0.0
+        if "n1_prefetch_start" in perf_times and "n1_prefetch_done" in perf_times:
+            n1_prefetch_ms = _calc_stage_time_ms(perf_times, "n1_prefetch_start", "n1_prefetch_done")
+        gauss_cull_legacy_ms = _calc_stage_time_ms(
+            perf_times,
+            "stage1_5_ssd_done",
+            "stage2_3_culling_done",
+        )
+
+        cur_counters: Dict[str, Any] = {
+            "batch_idx": batch_idx,
+            "future_blocks": int(metrics.get("cache_future_prefetch_blocks", 0)),
+            "urgent_blocks": int(metrics.get("cache_urgent_prefetch_blocks", 0)),
+            "ssd_bytes_read_future": int(metrics.get("ssd_bytes_read_future", 0)),
+            "ssd_bytes_read_urgent": int(metrics.get("ssd_bytes_read_urgent", 0)),
+            "future_storage_read_calls": int(metrics.get("future_storage_read_calls", 0)),
+            "future_storage_read_blocks": int(metrics.get("future_storage_read_blocks", 0)),
+            "future_storage_read_time_ms": float(metrics.get("future_storage_read_time_ms", 0.0)),
+            "urgent_storage_read_calls": int(metrics.get("urgent_storage_read_calls", 0)),
+            "urgent_storage_read_blocks": int(metrics.get("urgent_storage_read_blocks", 0)),
+            "urgent_storage_read_time_ms": float(metrics.get("urgent_storage_read_time_ms", 0.0)),
+            "future_reserved": int(metrics.get("future_prefetch_reserved", 0)),
+            "inflight_wait_blocks": int(metrics.get("inflight_wait_blocks", 0)),
+            "inflight_fallback_blocks": int(metrics.get("inflight_fallback_blocks", 0)),
+            "inflight_wait_time_ms": float(metrics.get("inflight_wait_time_ms", 0.0)),
+        }
+        key = os.path.abspath(batch_path)
+        prev_counters = _metrics_batch_prev.get(key)
+        reset = _metrics_batch_reset(cur_counters, prev_counters)
+
+        def delta(field: str) -> float:
+            if reset or prev_counters is None:
+                return 0.0
+            return max(0.0, _safe_float_value(cur_counters.get(field)) - _safe_float_value(prev_counters.get(field)))
+
+        resident_capacity = _safe_int_value(
+            stage_metrics.get("resident_capacity"),
+            _current_paper_resident_capacity(),
+        )
+        future_read_blocks_delta = delta("future_blocks")
+        future_read_mb_delta = delta("ssd_bytes_read_future") / (1024 * 1024)
+        urgent_read_mb_delta = delta("ssd_bytes_read_urgent") / (1024 * 1024)
+        future_storage_read_time_ms_delta = delta("future_storage_read_time_ms")
+        urgent_storage_read_time_ms_delta = delta("urgent_storage_read_time_ms")
+        future_storage_read_bw_mb_s: Any = ""
+        if future_storage_read_time_ms_delta > 0.0:
+            future_storage_read_bw_mb_s = future_read_mb_delta / (future_storage_read_time_ms_delta / 1000.0)
+        urgent_storage_read_bw_mb_s: Any = ""
+        if urgent_storage_read_time_ms_delta > 0.0:
+            urgent_storage_read_bw_mb_s = urgent_read_mb_delta / (urgent_storage_read_time_ms_delta / 1000.0)
+        bytes_per_block = _safe_int_value(metrics.get("bytes_per_block"))
+        cap_read_mb = resident_capacity * bytes_per_block / (1024 * 1024) if resident_capacity > 0 and bytes_per_block > 0 else 0.0
+        cap_transfer_ms_at_3p3gibs = cap_read_mb / (3.3 * 1024) * 1000.0 if cap_read_mb > 0.0 else 0.0
+        total_ms = _calc_stage_time_ms(perf_times, "iter_start", "iter_end")
+        cap_transfer_share_at_3p3gibs: Any = ""
+        if total_ms > 0.0 and cap_transfer_ms_at_3p3gibs > 0.0:
+            cap_transfer_share_at_3p3gibs = cap_transfer_ms_at_3p3gibs / total_ms
+        future_read_blocks_vs_rt: Any = ""
+        if resident_capacity > 0:
+            future_read_blocks_vs_rt = future_read_blocks_delta / float(resident_capacity)
+        future_read_blocks_vs_cap = future_read_blocks_vs_rt
+
+        row: Dict[str, Any] = {
+            "sample_idx": _next_metrics_sample_idx(batch_path),
+            "batch_idx": batch_idx,
+            "iteration": int(iteration),
+            "iter_end": int(iteration) + bsz,
+            "bsz": bsz,
+            "reset": 1 if reset else 0,
+            "resident_capacity": resident_capacity,
+            "r_t_size": _safe_int_value(stage_metrics.get("r_t_size")),
+            "r_t_next_size": _safe_int_value(stage_metrics.get("r_t_next_size")),
+            "k_t_size": _safe_int_value(stage_metrics.get("k_t_size")),
+            "k_t_next_size": _safe_int_value(stage_metrics.get("k_t_next_size")),
+            "delta_plus": _safe_int_value(stage_metrics.get("delta_plus")),
+            "delta_minus": _safe_int_value(stage_metrics.get("delta_minus")),
+            "hint_requested": _safe_int_value(stage_metrics.get("hint_requested")),
+            "hint_submitted": _safe_int_value(stage_metrics.get("hint_submitted")),
+            "future_read_blocks_delta": future_read_blocks_delta,
+            "future_read_mb_delta": future_read_mb_delta,
+            "urgent_read_blocks_delta": delta("urgent_blocks"),
+            "urgent_read_mb_delta": urgent_read_mb_delta,
+            "future_storage_read_calls_delta": delta("future_storage_read_calls"),
+            "future_storage_read_blocks_delta": delta("future_storage_read_blocks"),
+            "future_storage_read_time_ms_delta": future_storage_read_time_ms_delta,
+            "future_storage_read_bw_mb_s": future_storage_read_bw_mb_s,
+            "urgent_storage_read_calls_delta": delta("urgent_storage_read_calls"),
+            "urgent_storage_read_blocks_delta": delta("urgent_storage_read_blocks"),
+            "urgent_storage_read_time_ms_delta": urgent_storage_read_time_ms_delta,
+            "urgent_storage_read_bw_mb_s": urgent_storage_read_bw_mb_s,
+            "future_reserved_delta": delta("future_reserved"),
+            "inflight_wait_blocks_delta": delta("inflight_wait_blocks"),
+            "inflight_fallback_blocks_delta": delta("inflight_fallback_blocks"),
+            "inflight_wait_time_ms_delta": delta("inflight_wait_time_ms"),
+            "bytes_per_block": bytes_per_block,
+            "cap_read_mb": cap_read_mb,
+            "cap_transfer_ms_at_3p3gibs": cap_transfer_ms_at_3p3gibs,
+            "cap_transfer_share_at_3p3gibs": cap_transfer_share_at_3p3gibs,
+            "cache_size": int(metrics.get("cache_size", 0)),
+            "dirty_blocks": int(metrics.get("dirty_blocks", 0)),
+            "ram_usage_mb": float(metrics.get("ram_usage_mb", 0.0)),
+            "setup_ms": _calc_stage_time_ms(perf_times, "iter_start", "stage1_setup_done"),
+            "ssd_cull_load_ms": _calc_stage_time_ms(perf_times, "stage1_setup_done", "stage1_5_ssd_done"),
+            "n1_prefetch_ms": n1_prefetch_ms,
+            "gauss_cull_excl_n1_ms": max(0.0, gauss_cull_legacy_ms - n1_prefetch_ms),
+            "train_ms": _calc_stage_time_ms(perf_times, "stage2_3_culling_done", "stage4_train_done"),
+            "optim_ms": _calc_stage_time_ms(perf_times, "stage5_optim_start", "stage5_optim_done"),
+            "writeback_ms": _calc_stage_time_ms(perf_times, "stage5_optim_done", "stage5_writeback_done"),
+            "total_ms": total_ms,
+            "future_read_blocks_vs_rt": future_read_blocks_vs_rt,
+            "future_read_blocks_vs_cap": future_read_blocks_vs_cap,
+        }
+
+        needs_header = (not os.path.exists(batch_path)) or os.path.getsize(batch_path) == 0
+        with open(batch_path, "a", encoding="utf-8") as handle:
+            if needs_header:
+                handle.write("\t".join(METRICS_BATCH_FIELDS) + "\n")
+            handle.write("\t".join(_format_tsv_value(row.get(field, "")) for field in METRICS_BATCH_FIELDS) + "\n")
+        _metrics_batch_prev[key] = cur_counters
+    except Exception as exc:
+        msg = f"[METRICS BATCH] Warning: failed to write metrics_batch.tsv: {exc}\n"
+        if log_file is not None:
+            log_file.write(msg)
+        write_paper_phase1_log(msg, log_file=None)
+
+
+def write_paper_metrics_snapshot(
+    *,
+    iteration: int,
+    perf_times: Dict[str, float],
+    storage_adapter,
+    model_path: str,
+    batch_size: int,
+    log_file=None,
+) -> None:
+    if not model_path:
+        return
+
+    try:
+        bsz = max(1, int(batch_size or 1))
+        metrics = snapshot_paper_warm_layer_metrics(storage_adapter) or {}
+        snapshot_path = os.path.join(model_path, "metrics_snapshot.tsv")
+        os.makedirs(model_path, exist_ok=True)
+
+        n1_prefetch_ms = 0.0
+        if "n1_prefetch_start" in perf_times and "n1_prefetch_done" in perf_times:
+            n1_prefetch_ms = _calc_stage_time_ms(perf_times, "n1_prefetch_start", "n1_prefetch_done")
+        gauss_cull_legacy_ms = _calc_stage_time_ms(
+            perf_times,
+            "stage1_5_ssd_done",
+            "stage2_3_culling_done",
+        )
+
+        row: Dict[str, Any] = {
+            "sample_idx": _next_metrics_sample_idx(snapshot_path),
+            "batch_idx": (int(iteration) - 1) // bsz,
+            "iteration": int(iteration),
+            "iter_end": int(iteration) + bsz,
+            "bsz": bsz,
+            "cache_hits": int(metrics.get("cache_hits", 0)),
+            "cache_misses": int(metrics.get("cache_misses", 0)),
+            "prefetches": int(metrics.get("prefetches", 0)),
+            "hit_rate_cumulative": float(metrics.get("hit_rate", 0.0)),
+            "ssd_bytes_read_urgent": int(metrics.get("ssd_bytes_read_urgent", 0)),
+            "ssd_bytes_read_future": int(metrics.get("ssd_bytes_read_future", 0)),
+            "ssd_bytes_written_async": int(metrics.get("ssd_bytes_written_async", 0)),
+            "ssd_bytes_written_sync": int(metrics.get("ssd_bytes_written_sync", 0)),
+            "urgent_blocks": int(metrics.get("cache_urgent_prefetch_blocks", 0)),
+            "urgent_misses": int(metrics.get("cache_urgent_prefetch_miss_blocks", 0)),
+            "future_submitted": int(metrics.get("cache_future_prefetch_submitted", 0)),
+            "future_blocks": int(metrics.get("cache_future_prefetch_blocks", 0)),
+            "future_skipped": int(metrics.get("cache_future_prefetch_skipped", 0)),
+            "future_reserved": int(metrics.get("future_prefetch_reserved", 0)),
+            "urgent_storage_read_calls": int(metrics.get("urgent_storage_read_calls", 0)),
+            "urgent_storage_read_blocks": int(metrics.get("urgent_storage_read_blocks", 0)),
+            "urgent_storage_read_time_ms": float(metrics.get("urgent_storage_read_time_ms", 0.0)),
+            "future_storage_read_calls": int(metrics.get("future_storage_read_calls", 0)),
+            "future_storage_read_blocks": int(metrics.get("future_storage_read_blocks", 0)),
+            "future_storage_read_time_ms": float(metrics.get("future_storage_read_time_ms", 0.0)),
+            "inflight_wait_blocks": int(metrics.get("inflight_wait_blocks", 0)),
+            "inflight_fallback_blocks": int(metrics.get("inflight_fallback_blocks", 0)),
+            "inflight_wait_time_ms": float(metrics.get("inflight_wait_time_ms", 0.0)),
+            "bytes_per_block": int(metrics.get("bytes_per_block", 0)),
+            "cache_size": int(metrics.get("cache_size", 0)),
+            "dirty_blocks": int(metrics.get("dirty_blocks", 0)),
+            "flushing_blocks": int(metrics.get("flushing_blocks", 0)),
+            "flush_q": int(metrics.get("flush_queue_size", 0)),
+            "future_pending": int(metrics.get("cache_future_pending", 0)),
+            "ram_usage_mb": float(metrics.get("ram_usage_mb", 0.0)),
+            "setup_ms": _calc_stage_time_ms(perf_times, "iter_start", "stage1_setup_done"),
+            "ssd_cull_load_ms": _calc_stage_time_ms(perf_times, "stage1_setup_done", "stage1_5_ssd_done"),
+            "gauss_cull_legacy_ms": gauss_cull_legacy_ms,
+            "n1_prefetch_ms": n1_prefetch_ms,
+            "gauss_cull_excl_n1_ms": max(0.0, gauss_cull_legacy_ms - n1_prefetch_ms),
+            "train_ms": _calc_stage_time_ms(perf_times, "stage2_3_culling_done", "stage4_train_done"),
+            "optim_ms": _calc_stage_time_ms(perf_times, "stage5_optim_start", "stage5_optim_done"),
+            "writeback_ms": _calc_stage_time_ms(perf_times, "stage5_optim_done", "stage5_writeback_done"),
+            "total_ms": _calc_stage_time_ms(perf_times, "iter_start", "iter_end"),
+        }
+
+        needs_header = (not os.path.exists(snapshot_path)) or os.path.getsize(snapshot_path) == 0
+        with open(snapshot_path, "a", encoding="utf-8") as handle:
+            if needs_header:
+                handle.write("\t".join(METRICS_SNAPSHOT_FIELDS) + "\n")
+            handle.write("\t".join(_format_tsv_value(row.get(field, "")) for field in METRICS_SNAPSHOT_FIELDS) + "\n")
+    except Exception as exc:
+        msg = f"[METRICS SNAPSHOT] Warning: failed to write metrics_snapshot.tsv: {exc}\n"
+        if log_file is not None:
+            log_file.write(msg)
+        write_paper_phase1_log(msg, log_file=None)
+
+
+# Per-session snapshot for computing flush deltas between stage-detail log lines.
+_prev_flush_snapshot: Dict[str, int] = {
+    'async_flush_jobs': 0,
+    'async_flush_blocks': 0,
+    'sync_flush_jobs': 0,
+    'sync_flush_blocks': 0,
+    'ssd_bytes_written_async': 0,
+    'ssd_bytes_written_sync': 0,
+}
+
+
+def log_paper_stage_detail(
+    *,
+    iteration: int,
+    perf_times: Dict[str, float],
+    stage_metrics: Dict[str, Any],
+    log_file,
+    storage_adapter=None,
+) -> None:
+    """Print fine-grained sub-stage timings and data volumes for Stage 1.5.
+
+    Called from log_paper_perf_profile every _perf_log interval when
+    paper_debug_logging is enabled.
+    """
+    _dt = lambda s, e: _calc_stage_time_ms(perf_times, s, e)
+
+    ab_hit = stage_metrics.get('ab_buffer_hit', False)
+    ab_src = stage_metrics.get('ab_buffer_source', 'n/a')
+
+    lines = [f"[PAPER STAGE DETAIL] Iter {iteration}:"]
+
+    # ---- 1.5a: Block-level culling (incl. Stage 0 schedule interaction) ----
+    lines.append(
+        f"  stage1_5a_cull        : {_dt('iter_start','stage1_5a_cull_done'):8.1f}ms  "
+        f"|K_t|={stage_metrics.get('visible_block_ids','?'):>5}  "
+        f"vis={stage_metrics.get('visible_ratio_pct', 0.0):.1f}%"
+    )
+
+    # ---- 1.5b: A/B Buffer Check ----
+    if ab_hit:
+        lines.append(
+            f"  stage1_5b_ab_check    : {_dt('stage1_5a_cull_done','stage1_5b_ab_check_done'):8.1f}ms  "
+            f"HIT  src={ab_src}"
+        )
+    else:
+        hit_or_miss = "HIT" if ab_hit else "MISS"
+        miss_reason = stage_metrics.get('prefetch_miss_reason', 'n/a')
+        lines.append(
+            f"  stage1_5b_ab_check    : {_dt('stage1_5a_cull_done','stage1_5b_ab_check_done'):8.1f}ms  "
+            f"MISS  reason={miss_reason}"
+        )
+
+    # ---- 1.5c: Resident Set Resolution ----
+    if ab_hit:
+        lines.append(f"  stage1_5c_resident    : {'(skipped — AB buffer hit)':>40}")
+    else:
+        rt = stage_metrics.get('r_t_size', '?')
+        rt_ur = stage_metrics.get('r_t_size_unrestricted', rt)
+        kt = stage_metrics.get('k_t_size', '?')
+        cap = stage_metrics.get('resident_capacity', '?')
+        policy = stage_metrics.get('resident_policy', '?')
+        lines.append(
+            f"  stage1_5c_resident    : {_dt('stage1_5b_ab_check_done','stage1_5c_resident_done'):8.1f}ms  "
+            f"|R_t|={rt}(/{rt_ur} unrestrict)  |K_t|={kt}  cap={cap}  policy={policy}"
+        )
+
+    # ---- 1.5d: SSD→RAM→GPU Load ----
+    if ab_hit:
+        lines.append(f"  stage1_5d_ssd_load    : {'(skipped — AB buffer hit)':>40}")
+    else:
+        sync_src = stage_metrics.get('sync_load_source', 'sync_ram_to_gpu')
+        sync_vis = stage_metrics.get('sync_visible_block_ids', '?')
+        lines.append(
+            f"  stage1_5d_ssd_load    : {_dt('stage1_5c_resident_done','stage1_5d_ssd_load_done'):8.1f}ms  "
+            f"loaded={sync_vis}  src={sync_src}"
+        )
+
+    # ---- 1.5e: Delta Calculation ----
+    delta_plus = stage_metrics.get('delta_plus', 0)
+    delta_minus = stage_metrics.get('delta_minus', 0)
+    rt_next = stage_metrics.get('r_t_next_size', '?')
+    kt_next = stage_metrics.get('k_t_next_size', '?')
+    lines.append(
+        f"  stage1_5e_delta       : {_dt('stage1_5d_ssd_load_done','stage1_5e_delta_done'):8.1f}ms  "
+        f"|K_t+1|={kt_next}  Δ+={delta_plus}  Δ-={delta_minus}  |R_t+1|={rt_next}"
+    )
+
+    # ---- 1.5f: Early Delta+ Hint ----
+    submitted = stage_metrics.get('hint_submitted', 0)
+    requested = stage_metrics.get('hint_requested', 0)
+    lines.append(
+        f"  stage1_5f_hint        : {_dt('stage1_5e_delta_done','stage1_5f_hint_done'):8.1f}ms  "
+        f"submitted={submitted}/{requested}"
+    )
+
+    # ---- 1.5g: Async A/B Prefetch Launch ----
+    resident = stage_metrics.get('g_current_resident_blocks', '?')
+    streamed = stage_metrics.get('g_stream_in_for_next', 0)
+    evicted = stage_metrics.get('g_evict_blocks', 0)
+    lines.append(
+        f"  stage1_5g_ab_prefetch : {_dt('stage1_5f_hint_done','stage1_5g_prefetch_launch_done'):8.1f}ms  "
+        f"resident={resident}  streamed={streamed}  evicted={evicted}"
+    )
+
+    # ---- Separator & totals ----
+    lines.append("  " + "─" * 72)
+
+    # Total Stage 1.5 breakdown vs coarse timer
+    lines.append(
+        f"  stage1_5_total (detail): {_dt('stage1_5a_cull_done','stage1_5g_prefetch_launch_done'):.0f}ms  "
+        f"(coarse ssd_cull+load={_dt('stage1_setup_done','stage1_5_ssd_done'):.0f}ms)"
+    )
+
+    # ---- Dirty flush delta (SSD writes since last detail log) ----
+    global _prev_flush_snapshot
+    if storage_adapter is not None:
+        cache = getattr(storage_adapter, "cache", None)
+        if cache is not None:
+            stats = cache.get_stats()
+            cur_async_jobs = int(stats.get('async_flush_jobs', 0))
+            cur_async_blks = int(stats.get('async_flush_blocks', 0))
+            cur_sync_jobs = int(stats.get('sync_flush_jobs', 0))
+            cur_sync_blks = int(stats.get('sync_flush_blocks', 0))
+            cur_async_bytes = int(stats.get('ssd_bytes_written_async', 0))
+            cur_sync_bytes = int(stats.get('ssd_bytes_written_sync', 0))
+
+            d_async_jobs = cur_async_jobs - _prev_flush_snapshot['async_flush_jobs']
+            d_async_blks = cur_async_blks - _prev_flush_snapshot['async_flush_blocks']
+            d_sync_jobs = cur_sync_jobs - _prev_flush_snapshot['sync_flush_jobs']
+            d_sync_blks = cur_sync_blks - _prev_flush_snapshot['sync_flush_blocks']
+            d_async_mb = (cur_async_bytes - _prev_flush_snapshot['ssd_bytes_written_async']) / (1024 * 1024)
+            d_sync_mb = (cur_sync_bytes - _prev_flush_snapshot['ssd_bytes_written_sync']) / (1024 * 1024)
+
+            if d_async_jobs or d_sync_jobs:
+                parts = []
+                if d_async_jobs:
+                    parts.append(f"async={d_async_jobs}jobs/{d_async_blks}blk/{d_async_mb:.1f}MB")
+                if d_sync_jobs:
+                    parts.append(f"sync={d_sync_jobs}jobs/{d_sync_blks}blk/{d_sync_mb:.1f}MB")
+                flushing_now = int(stats.get('flushing_blocks', 0))
+                flush_q = int(stats.get('flush_queue_size', 0))
+                parts.append(f"flushing_now={flushing_now}blk  flush_q={flush_q}")
+                lines.append("  dirty_flush (delta): " + "  ".join(parts))
+
+            # Update snapshot
+            _prev_flush_snapshot['async_flush_jobs'] = cur_async_jobs
+            _prev_flush_snapshot['async_flush_blocks'] = cur_async_blks
+            _prev_flush_snapshot['sync_flush_jobs'] = cur_sync_jobs
+            _prev_flush_snapshot['sync_flush_blocks'] = cur_sync_blks
+            _prev_flush_snapshot['ssd_bytes_written_async'] = cur_async_bytes
+            _prev_flush_snapshot['ssd_bytes_written_sync'] = cur_sync_bytes
+
+    msg = "\n".join(lines) + "\n"
+    log_file.write(msg)
+    write_paper_phase1_log(msg, log_file=None)
+
+
 def log_paper_perf_profile(
     *,
     iteration: int,
     perf_times: Dict[str, float],
     log_file,
     storage_adapter=None,
+    paper_stage_metrics: Optional[Dict[str, Any]] = None,
+    paper_debug_logging: bool = False,
+    model_path: str = "",
+    batch_size: int = 0,
 ) -> None:
     def _dt(start: str, end: str) -> float:
         iter_start = perf_times["iter_start"]
         return (perf_times.get(end, iter_start) - perf_times.get(start, iter_start)) * 1000.0
 
+    n1_prefetch_ms = 0.0
+    if "n1_prefetch_start" in perf_times and "n1_prefetch_done" in perf_times:
+        n1_prefetch_ms = _dt("n1_prefetch_start", "n1_prefetch_done")
+    gauss_cull_legacy_ms = _dt("stage1_5_ssd_done", "stage2_3_culling_done")
+    gauss_cull_excl_n1_ms = max(0.0, gauss_cull_legacy_ms - n1_prefetch_ms)
+
     perf_message = (
         f"[PERF] Iter {iteration}: "
         f"setup={_dt('iter_start','stage1_setup_done'):.0f}ms  "
         f"ssd_cull+load={_dt('stage1_setup_done','stage1_5_ssd_done'):.0f}ms  "
-        f"gauss_cull={_dt('stage1_5_ssd_done','stage2_3_culling_done'):.0f}ms  "
+        f"gauss_cull={gauss_cull_legacy_ms:.0f}ms  "
         f"train={_dt('stage2_3_culling_done','stage4_train_done'):.0f}ms  "
         f"optim={_dt('stage5_optim_start','stage5_optim_done'):.0f}ms  "
         f"writeback={_dt('stage5_optim_done','stage5_writeback_done'):.0f}ms  "
         f"cuda_sync={_dt('stage5_writeback_done','stage5_sync_done'):.0f}ms  "
         f"cleanup={_dt('stage5_sync_done','iter_end'):.0f}ms  "
-        f"TOTAL={_dt('iter_start','iter_end'):.0f}ms\n"
+        f"TOTAL={_dt('iter_start','iter_end'):.0f}ms  "
+        f"n1_prefetch={n1_prefetch_ms:.0f}ms  "
+        f"gauss_cull_excl_n1={gauss_cull_excl_n1_ms:.0f}ms\n"
     )
     log_file.write(perf_message)
     write_paper_phase1_log(perf_message, log_file=None)
+    write_paper_metrics_snapshot(
+        iteration=iteration,
+        perf_times=perf_times,
+        storage_adapter=storage_adapter,
+        model_path=model_path,
+        batch_size=batch_size,
+        log_file=log_file,
+    )
     log_paper_warm_layer_metrics(storage_adapter, iteration, "perf", log_file=log_file)
+    if paper_debug_logging and paper_stage_metrics:
+        log_paper_stage_detail(
+            iteration=iteration,
+            perf_times=perf_times,
+            stage_metrics=paper_stage_metrics,
+            log_file=log_file,
+            storage_adapter=storage_adapter,
+        )
 
 
 def load_paper_stage1_working_set(
@@ -1419,8 +2065,11 @@ def load_paper_stage1_working_set(
     get_double_buffer_gpu_fn: Callable,
     ensure_local_to_global_mapping_fn: Callable,
     resolve_current_iteration_resident_blocks_fn: Callable,
+    perf_t: Optional[Dict[str, float]] = None,
+    paper_stage_metrics: Optional[Dict[str, Any]] = None,
     log_file=None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], bool, str]:
+    import time as _time
     used_prefetch_buffer = False
     load_source: Optional[str] = None
     gpu_tensors = None
@@ -1450,8 +2099,17 @@ def load_paper_stage1_working_set(
                     log_file=log_file,
                 )
                 log_paper_warm_layer_metrics(storage_adapter, iteration, "load", log_file=log_file)
+        if perf_t is not None:
+            perf_t['stage1_5b_ab_check_done'] = _time.perf_counter()
 
     if used_prefetch_buffer:
+        if perf_t is not None:
+            _now = _time.perf_counter()
+            perf_t.setdefault('stage1_5c_resident_done', _now)
+            perf_t.setdefault('stage1_5d_ssd_load_done', _now)
+        if paper_stage_metrics is not None:
+            paper_stage_metrics['ab_buffer_hit'] = True
+            paper_stage_metrics['ab_buffer_source'] = str(load_source)
         return gpu_tensors, retention_stats, used_prefetch_buffer, str(load_source)
 
     ab_stats = gaussians._paper_ab_runtime_stats
@@ -1469,6 +2127,9 @@ def load_paper_stage1_working_set(
             ab_stats=ab_stats,
             log_file=log_file,
         )
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['ab_buffer_hit'] = False
+        paper_stage_metrics['prefetch_miss_reason'] = miss_reason
 
     sync_visible_block_ids = visible_block_ids
     total_blocks_estimate = (total_n_gaussians + args.gaussian_block_size - 1) // args.gaussian_block_size
@@ -1479,6 +2140,14 @@ def load_paper_stage1_working_set(
         num_total_blocks=int(total_blocks_estimate),
         current_camera_blocks=current_camera_blocks,
     )
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['resident_policy'] = str(getattr(args, "paper_resident_selection_policy", "passthrough_active_set"))
+        paper_stage_metrics['resident_capacity'] = args.paper_resident_capacity_blocks
+        paper_stage_metrics['r_t_size_unrestricted'] = len(r_t_blocks)
+        paper_stage_metrics['k_t_size'] = len(visible_block_ids)
+        paper_stage_metrics['r_t_size_unrestricted'] = len(r_t_blocks)  # may be updated below
+    if perf_t is not None:
+        perf_t['stage1_5c_resident_done'] = _time.perf_counter()
 
     if not use_fast_ram_ssd_path:
         reachable = set(int(b) for b in visible_block_ids)
@@ -1493,6 +2162,9 @@ def load_paper_stage1_working_set(
                 log_file=log_file,
             )
         r_t_blocks = r_t_blocks_restricted
+
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['r_t_size'] = len(r_t_blocks)
 
     policy = str(getattr(args, "paper_resident_selection_policy", "passthrough_active_set")).lower()
     if policy in {"topc", "topc_strict", "topc_balanced"} and r_t_blocks:
@@ -1526,6 +2198,11 @@ def load_paper_stage1_working_set(
         ),
         block_reader=active_block_reader,
     )
+    if perf_t is not None:
+        perf_t['stage1_5d_ssd_load_done'] = _time.perf_counter()
+    if paper_stage_metrics is not None:
+        paper_stage_metrics['sync_load_source'] = str(load_source) if load_source else "sync_ram_to_gpu"
+        paper_stage_metrics['sync_visible_block_ids'] = len(sync_visible_block_ids)
     if load_source is None:
         load_source = "sync_ram_to_gpu"
     return gpu_tensors, retention_stats, used_prefetch_buffer, load_source

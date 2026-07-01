@@ -48,7 +48,7 @@ def get_camera_batch_schedule(
     schedule_ordering = str(schedule_ordering).lower()
     rng = np.random.RandomState(seed=epoch_seed_base + epoch)
 
-    if schedule_ordering == "shuffle":
+    if schedule_ordering in ("shuffle", "random"):
         epoch_camera_offset = 0
         epoch_schedule = rng.permutation(np.asarray(training_schedule, dtype=np.int64)).tolist()
         batch_start_cam = within_epoch_idx * batch_size

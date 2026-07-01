@@ -158,6 +158,7 @@ from strategies.tide_engine.runtime import (
     log_paper_gpu_working_set_parameters as _log_paper_gpu_working_set_parameters,
     log_paper_perf_profile as _log_paper_perf_profile,
     log_paper_warm_layer_metrics as _log_paper_warm_layer_metrics,
+    write_paper_metrics_batch as _write_paper_metrics_batch,
     log_ssd_stage1_debug as _log_ssd_stage1_debug,
     log_early_delta_hint as _log_early_delta_hint,
     log_paper_cpu_source_refs_restored as _log_paper_cpu_source_refs_restored,
@@ -912,6 +913,7 @@ def clm_offload_train_one_batch(
     # ========================================================================
     import time as _time
     _perf_t = {}
+    _paper_stage_metrics = {}  # accumulates data volume counters for detailed stage logging
     # iterations step by bsz (1, 65, 129, ...), so "% 50 == 1" only fires once
     # use a counter that increments per batch instead
     if not hasattr(clm_offload_train_one_batch, '_batch_count'):
@@ -1020,7 +1022,9 @@ def clm_offload_train_one_batch(
             cam_to_blocks[cam_global_idx] = len(blocks)
 
         visible_block_ids = sorted(list(visible_block_ids_set))
-        
+        _paper_stage_metrics['visible_block_ids'] = len(visible_block_ids)
+        _paper_stage_metrics['num_cameras'] = len(batched_cameras)
+
         _log_paper_block_visibility_debug(
             enabled=paper_debug_logging,
             iteration=iteration,
@@ -1070,6 +1074,10 @@ def clm_offload_train_one_batch(
             log_file.write(
                 f"[SSD] Iter {iteration}: {len(visible_block_ids)}/{total_blocks} blocks visible ({vis_ratio:.1f}%)\n"
             )
+        total_blocks = storage_adapter.culler.num_blocks
+        _paper_stage_metrics['total_blocks'] = total_blocks
+        _paper_stage_metrics['visible_ratio_pct'] = 100.0 * len(visible_block_ids) / total_blocks if total_blocks > 0 else 0.0
+        _ts('stage1_5a_cull_done')
 
         paper_block_sets = None
         paper_ab_buffer_source = None
@@ -1228,6 +1236,8 @@ def clm_offload_train_one_batch(
                         get_double_buffer_gpu_fn=get_double_buffer_gpu,
                         ensure_local_to_global_mapping_fn=ensure_local_to_global_mapping,
                         resolve_current_iteration_resident_blocks_fn=_resolve_current_iteration_resident_blocks,
+                        perf_t=_perf_t,
+                        paper_stage_metrics=_paper_stage_metrics,
                         log_file=log_file,
                     )
                 else:
@@ -1257,6 +1267,10 @@ def clm_offload_train_one_batch(
                 gaussians.gpu_working_set_manager.gpu_opacity = gaussians._opacity
                 gaussians.gpu_working_set_manager.gpu_features_dc = gaussians._features_dc
                 gaussians.gpu_working_set_manager.gpu_features_rest = gaussians._features_rest
+                # For non-paper path, timestamp SSD→GPU load completion
+                if not is_paper_ssd_mode:
+                    _ts('stage1_5b_ab_check_done')
+                    _ts('stage1_5d_ssd_load_done')
 
                 if is_paper_ssd_mode:
                     double_buffer = get_double_buffer_gpu(
@@ -1271,6 +1285,11 @@ def clm_offload_train_one_batch(
                         preserve_resident_metadata=used_paper_prefetch_buffer,
                     )
                     actual_current_resident_blocks = list(gaussians.gpu_working_set_manager.loaded_blocks)
+                    _paper_stage_metrics['resident_policy'] = str(getattr(args, "paper_resident_selection_policy", "passthrough_active_set"))
+                    _paper_stage_metrics['resident_capacity'] = args.paper_resident_capacity_blocks
+                    _paper_stage_metrics['r_t_size_unrestricted'] = len(actual_current_resident_blocks)
+                    _paper_stage_metrics['r_t_size'] = len(actual_current_resident_blocks)
+                    _paper_stage_metrics['k_t_size'] = len(visible_block_ids)
                     paper_block_sets = _compute_paper_block_sets(
                         storage_adapter=storage_adapter,
                         training_schedule=training_schedule,
@@ -1294,6 +1313,13 @@ def clm_offload_train_one_batch(
                         paper_block_sets.get('updated_recency_scores', {})
                     )
                     stream_in_for_next = list(paper_block_sets.get('stream_in_blocks', []))
+                    evict_blocks = list(paper_block_sets.get('evict_blocks', []))
+                    _paper_stage_metrics['delta_plus'] = len(stream_in_for_next)
+                    _paper_stage_metrics['delta_minus'] = len(evict_blocks)
+                    _paper_stage_metrics['r_t_next_size'] = len(paper_block_sets.get('next_resident_blocks', []))
+                    _paper_stage_metrics['k_t_next_size'] = len(paper_block_sets.get('next_active_blocks', []))
+                    _ts('stage1_5e_delta_done')
+
                     active_block_reader = getattr(gaussians, '_block_reader', None)
                     if active_block_reader is not None and stream_in_for_next:
                         paper_delta_future_submitted_early = int(active_block_reader.hint_future(stream_in_for_next) or 0)
@@ -1305,6 +1331,10 @@ def clm_offload_train_one_batch(
                                 requested=len(stream_in_for_next),
                                 log_file=log_file,
                             )
+                    _paper_stage_metrics['hint_submitted'] = int(paper_delta_future_submitted_early) if stream_in_for_next else 0
+                    _paper_stage_metrics['hint_requested'] = len(stream_in_for_next)
+                    _ts('stage1_5f_hint_done')
+
                     _configure_gpu_resident_optimizer_state(
                         gaussians=gaussians,
                         args=args,
@@ -1313,6 +1343,11 @@ def clm_offload_train_one_batch(
                         get_gpu_resident_optimizer_fn=get_gpu_resident_optimizer,
                         log_file=log_file,
                     )
+                    _paper_stage_metrics['g_current_resident_blocks'] = len(actual_current_resident_blocks)
+                    _paper_stage_metrics['g_stream_in_for_next'] = len(stream_in_for_next)
+                    _paper_stage_metrics['g_evict_blocks'] = len(evict_blocks)
+                    _ts('stage1_5g_prefetch_launch_done')
+
                     if should_log_paper_sets:
                         _log_paper_block_sets(
                             log_file=log_file,
@@ -1818,6 +1853,7 @@ def clm_offload_train_one_batch(
     # - GPU Compute Stream: Forward/Backward on current batch
     # - GPU Prefetch Stream: Load next batch's data in background
     if storage_adapter is not None and training_schedule is not None and (use_fast_ram_ssd_path or is_paper_ssd_mode):
+        _ts('n1_prefetch_start')
         torch.cuda.nvtx.range_push("N+1 Prefetch: Start async load")
 
         try:
@@ -1904,6 +1940,7 @@ def clm_offload_train_one_batch(
                 log_file.write(f"[N+1 PREFETCH] Warning: Prefetch failed: {e}\n")
 
         torch.cuda.nvtx.range_pop()
+        _ts('n1_prefetch_done')
 
     # ============================================================================
     # STAGE 2: MICRO-BATCH SIGNAL INITIALIZATION
@@ -3203,6 +3240,16 @@ def clm_offload_train_one_batch(
     
     # [PERF PROFILE] Print stage timings
     _ts('iter_end')
+    if is_paper_ssd_mode:
+        _write_paper_metrics_batch(
+            iteration=iteration,
+            perf_times=_perf_t,
+            storage_adapter=storage_adapter,
+            model_path=getattr(args, "model_path", ""),
+            batch_size=bsz,
+            paper_stage_metrics=_paper_stage_metrics,
+            log_file=log_file,
+        )
     if _perf_log:
         if is_paper_ssd_mode:
             _log_paper_perf_profile(
@@ -3210,6 +3257,10 @@ def clm_offload_train_one_batch(
                 perf_times=_perf_t,
                 log_file=log_file,
                 storage_adapter=storage_adapter,
+                paper_stage_metrics=_paper_stage_metrics,
+                paper_debug_logging=paper_debug_logging,
+                model_path=getattr(args, "model_path", ""),
+                batch_size=bsz,
             )
         else:
             def _dt(a, b):
