@@ -127,6 +127,21 @@ class GPUBuffer:
         self.num_gaussians = 0
 
 
+@dataclass
+class PaperPrefetchJob:
+    """Host/CUDA completion state for one Paper SSD prefetch."""
+
+    iteration: int
+    target_buffer_idx: int
+    host_done: threading.Event
+    omega_copy_event: torch.cuda.Event
+    cold_copy_event: torch.cuda.Event
+    complete_event: torch.cuda.Event
+    submitted_at: float
+    error: Optional[BaseException] = None
+    thread: Optional[threading.Thread] = None
+
+
 class DoubleBufferGPUWorkingSet:
     """
     Double-buffered GPU working set manager with N+1 prefetch.
@@ -176,6 +191,7 @@ class DoubleBufferGPUWorkingSet:
         self.prefetch_complete_event = torch.cuda.Event()
         self.prefetch_in_progress = False
         self.prefetch_iteration = -1
+        self._paper_prefetch_job: Optional[PaperPrefetchJob] = None
         
         # Lock for thread safety
         self.lock = threading.Lock()
@@ -186,6 +202,11 @@ class DoubleBufferGPUWorkingSet:
             'prefetch_hits': 0,
             'prefetch_misses': 0,
             'total_prefetch_time_ms': 0.0,
+            'async_submit_ms': 0.0,
+            'host_read_wait_ms': 0.0,
+            'writeback_tail_wait_ms': 0.0,
+            'prefetch_failures': 0,
+            'activation_wait_ms': 0.0,
         }
         
         self._log("[DoubleBufferGPU] Initialized with 2 GPU buffers")
@@ -275,7 +296,264 @@ class DoubleBufferGPUWorkingSet:
             # Swap
             self.active_buffer_idx = 1 - self.active_buffer_idx
             self.stats['swaps'] += 1
-    
+
+    def _buffer_at(self, buffer_idx: int) -> GPUBuffer:
+        return self.buffer_a if int(buffer_idx) == 0 else self.buffer_b
+
+    def start_paper_prefetch(
+        self,
+        iteration: int,
+        visible_block_ids: List[int],
+        filters_global: Optional[List[torch.Tensor]],
+        resident_block_ids: Optional[List[int]],
+        evicted_block_ids: Optional[List[int]],
+        block_reader: object,
+    ) -> None:
+        """Start Paper SSD prefetch without waiting for cold block reads.
+
+        The caller prepares the target layout and enqueues Omega D2D copies.
+        A daemon worker waits for Delta+ SSD reads and enqueues their H2D copies.
+        """
+        if block_reader is None:
+            raise ValueError('Paper prefetch requires a block_reader')
+
+        submit_start = time.perf_counter()
+        with self.lock:
+            if self.prefetch_in_progress:
+                raise RuntimeError(
+                    f'Cannot start Paper prefetch for iteration {iteration}: '
+                    f'iteration {self.prefetch_iteration} is still in progress'
+                )
+            self.prefetch_in_progress = True
+            self.prefetch_iteration = int(iteration)
+            target_buffer_idx = 1 - self.active_buffer_idx
+
+        target_buffer = self._buffer_at(target_buffer_idx)
+        source_buffer = self.active_buffer
+        target_buffer.clear()
+
+        sorted_visible_blocks = sorted(set(int(block_id) for block_id in visible_block_ids))
+        resident_set = set(int(block_id) for block_id in (resident_block_ids or []))
+        evicted_set = set(int(block_id) for block_id in (evicted_block_ids or []))
+        filters_global = filters_global or []
+
+        omega_copy_event = torch.cuda.Event()
+        cold_copy_event = torch.cuda.Event()
+        complete_event = torch.cuda.Event()
+        job = PaperPrefetchJob(
+            iteration=int(iteration),
+            target_buffer_idx=target_buffer_idx,
+            host_done=threading.Event(),
+            omega_copy_event=omega_copy_event,
+            cold_copy_event=cold_copy_event,
+            complete_event=complete_event,
+            submitted_at=submit_start,
+        )
+
+        try:
+            block_lengths: Dict[int, int] = {}
+            all_gaussian_ids_list: List[int] = []
+            num_visible = 0
+            for block_id in sorted_visible_blocks:
+                start_idx = block_id * self.block_size
+                end_idx = min(start_idx + self.block_size, self.num_total)
+                block_len = end_idx - start_idx
+                block_lengths[block_id] = block_len
+                num_visible += block_len
+                all_gaussian_ids_list.extend(range(start_idx, end_idx))
+
+            target_buffer.xyz = torch.empty(num_visible, 3, device=self.device, dtype=torch.float32)
+            target_buffer.scaling = torch.empty(num_visible, 3, device=self.device, dtype=torch.float32)
+            target_buffer.rotation = torch.empty(num_visible, 4, device=self.device, dtype=torch.float32)
+            target_buffer.opacity = torch.empty(num_visible, 1, device=self.device, dtype=torch.float32)
+            target_buffer.features_dc = torch.empty(num_visible, 3, device=self.device, dtype=torch.float32)
+            target_buffer.features_rest = torch.empty(num_visible, 45, device=self.device, dtype=torch.float32)
+
+            cold_ids: List[int] = []
+            resident_blocks_used: List[int] = []
+            offset = 0
+            for block_id in sorted_visible_blocks:
+                block_len = block_lengths[block_id]
+                target_slice = slice(offset, offset + block_len)
+                target_buffer.block_to_local_slice[block_id] = target_slice
+                can_copy_resident = (
+                    block_id in resident_set
+                    and source_buffer is not None
+                    and source_buffer.block_to_local_slice is not None
+                    and block_id in source_buffer.block_to_local_slice
+                    and not source_buffer.is_empty()
+                )
+                if can_copy_resident:
+                    resident_blocks_used.append(block_id)
+                else:
+                    cold_ids.append(block_id)
+                offset += block_len
+
+            target_buffer.loaded_blocks = sorted_visible_blocks
+            target_buffer.num_gaussians = num_visible
+            target_buffer.resident_blocks = resident_blocks_used
+            target_buffer.streamed_blocks = list(cold_ids)
+            target_buffer.evicted_blocks = sorted(evicted_set)
+
+            all_gaussian_ids = torch.tensor(all_gaussian_ids_list, dtype=torch.long)
+            with torch.cuda.stream(self.prefetch_stream), torch.no_grad():
+                target_buffer.local_to_global_idx = all_gaussian_ids.to(self.device)
+                target_buffer._block_starts = _build_block_starts(
+                    target_buffer.block_to_local_slice, self.num_blocks, self.device,
+                )
+
+                target_buffer.filters_local = []
+                for filter_global in filters_global:
+                    if filter_global is not None and len(filter_global) > 0:
+                        filter_local = _global_ids_to_local(
+                            filter_global.to(self.device),
+                            target_buffer._block_starts,
+                            self.block_size,
+                        )
+                        target_buffer.filters_local.append(filter_local[filter_local >= 0])
+                    else:
+                        target_buffer.filters_local.append(
+                            torch.tensor([], dtype=torch.long, device=self.device)
+                        )
+
+                torch.cuda.nvtx.range_push('N+1 Omega D2D')
+                try:
+                    for block_id in resident_blocks_used:
+                        source_slice = source_buffer.block_to_local_slice[block_id]
+                        target_slice = target_buffer.block_to_local_slice[block_id]
+                        target_buffer.xyz[target_slice] = source_buffer.xyz[source_slice].detach()
+                        target_buffer.scaling[target_slice] = source_buffer.scaling[source_slice].detach()
+                        target_buffer.rotation[target_slice] = source_buffer.rotation[source_slice].detach()
+                        target_buffer.opacity[target_slice] = source_buffer.opacity[source_slice].detach()
+                        target_buffer.features_dc[target_slice] = source_buffer.features_dc[source_slice].detach()
+                        target_buffer.features_rest[target_slice] = source_buffer.features_rest[source_slice].detach()
+                    omega_copy_event.record(self.prefetch_stream)
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+            with self.lock:
+                self._paper_prefetch_job = job
+
+            def _cold_worker() -> None:
+                try:
+                    torch.cuda.nvtx.range_push('N+1 Cold Read Wait')
+                    read_start = time.perf_counter()
+                    try:
+                        reader_blocks = block_reader.read_blocks(cold_ids)
+                    finally:
+                        read_ms = (time.perf_counter() - read_start) * 1000.0
+                        with self.lock:
+                            self.stats['host_read_wait_ms'] += read_ms
+                        torch.cuda.nvtx.range_pop()
+
+                    reader_layout = block_reader.layout
+                    from storage.block_reader import BlockLayout
+
+                    with torch.cuda.device(self.device), torch.cuda.stream(self.prefetch_stream), torch.no_grad():
+                        torch.cuda.nvtx.range_push('N+1 Cold H2D')
+                        try:
+                            for block_id in cold_ids:
+                                if block_id not in reader_blocks:
+                                    raise KeyError(
+                                        f'Block {block_id} missing from Paper prefetch reader result'
+                                    )
+                                target_slice = target_buffer.block_to_local_slice[block_id]
+                                block_len = target_slice.stop - target_slice.start
+                                block_gpu = reader_blocks[block_id][:block_len].to(
+                                    self.device, non_blocking=True,
+                                )
+                                if reader_layout == BlockLayout.UNIFIED:
+                                    target_buffer.xyz[target_slice] = block_gpu[:, 0:3]
+                                    target_buffer.opacity[target_slice] = block_gpu[:, 3:4]
+                                    target_buffer.scaling[target_slice] = block_gpu[:, 4:7]
+                                    target_buffer.rotation[target_slice] = block_gpu[:, 7:11]
+                                    target_buffer.features_dc[target_slice] = block_gpu[:, 11:14]
+                                    target_buffer.features_rest[target_slice] = block_gpu[:, 14:59]
+                                else:
+                                    target_buffer.xyz[target_slice] = block_gpu[:, 0:3]
+                                    target_buffer.scaling[target_slice] = block_gpu[:, 3:6]
+                                    target_buffer.rotation[target_slice] = block_gpu[:, 6:10]
+                                    target_buffer.opacity[target_slice] = block_gpu[:, 10:11]
+                                    target_buffer.features_dc[target_slice] = block_gpu[:, 11:14]
+                                    target_buffer.features_rest[target_slice] = block_gpu[:, 14:59]
+                            cold_copy_event.record(self.prefetch_stream)
+                            complete_event.record(self.prefetch_stream)
+                        finally:
+                            torch.cuda.nvtx.range_pop()
+
+                    with self.lock:
+                        self.stats['total_prefetch_time_ms'] += (
+                            time.perf_counter() - job.submitted_at
+                        ) * 1000.0
+                except BaseException as exc:
+                    with self.lock:
+                        job.error = exc
+                        self.stats['prefetch_failures'] += 1
+                    self._log(
+                        f'[DoubleBufferGPU] Paper prefetch failed for iteration '
+                        f'{job.iteration}: {exc}'
+                    )
+                finally:
+                    job.host_done.set()
+
+            thread = threading.Thread(
+                target=_cold_worker,
+                name=f'paper-prefetch-{iteration}',
+                daemon=True,
+            )
+            job.thread = thread
+            thread.start()
+            with self.lock:
+                self.stats['async_submit_ms'] += (
+                    time.perf_counter() - submit_start
+                ) * 1000.0
+        except BaseException:
+            self.prefetch_stream.synchronize()
+            target_buffer.clear()
+            with self.lock:
+                self._paper_prefetch_job = None
+                self.prefetch_in_progress = False
+                self.prefetch_iteration = -1
+            raise
+
+    def wait_for_paper_omega_before_update(self, iteration: int) -> bool:
+        """Order optimizer writes after the pre-optimizer Omega D2D copy."""
+        with self.lock:
+            job = self._paper_prefetch_job
+            if job is None or job.iteration != int(iteration):
+                return False
+            omega_copy_event = job.omega_copy_event
+        torch.cuda.current_stream(self.device).wait_event(omega_copy_event)
+        return True
+
+    def wait_for_paper_host_enqueue(self, iteration: int) -> bool:
+        """Wait only when writeback must enqueue Omega refresh after cold H2D."""
+        with self.lock:
+            job = self._paper_prefetch_job
+            if job is None or job.iteration != int(iteration):
+                return False
+
+        wait_start = time.perf_counter()
+        job.host_done.wait()
+        wait_ms = (time.perf_counter() - wait_start) * 1000.0
+        with self.lock:
+            self.stats['writeback_tail_wait_ms'] += wait_ms
+            failed = job.error is not None
+        if failed:
+            self.prefetch_stream.synchronize()
+            self._buffer_at(job.target_buffer_idx).clear()
+            with self.lock:
+                self.prefetch_in_progress = False
+                self.prefetch_iteration = -1
+        return not failed
+
+    def get_paper_prefetch_error(self, iteration: int) -> Optional[BaseException]:
+        with self.lock:
+            job = self._paper_prefetch_job
+            if job is None or job.iteration != int(iteration):
+                return None
+            return job.error
+
     def start_prefetch(
         self,
         iteration: int,
@@ -511,37 +789,55 @@ class DoubleBufferGPUWorkingSet:
 
         refreshed = 0
         with torch.cuda.stream(self.prefetch_stream):
-            for block_id in block_ids:
-                if block_id not in target_buffer.block_to_local_slice:
-                    continue
-                if block_id not in block_cache:
-                    continue
+            torch.cuda.nvtx.range_push('N+1 Omega Refresh')
+            try:
+                for block_id in block_ids:
+                    if block_id not in target_buffer.block_to_local_slice:
+                        continue
+                    if block_id not in block_cache:
+                        continue
 
-                target_slice = target_buffer.block_to_local_slice[block_id]
-                block_len = target_slice.stop - target_slice.start
-                if block_len <= 0:
-                    continue
+                    target_slice = target_buffer.block_to_local_slice[block_id]
+                    block_len = target_slice.stop - target_slice.start
+                    if block_len <= 0:
+                        continue
 
-                block_tensor = block_cache[block_id]
-                if block_tensor is None or block_tensor.numel() == 0:
-                    continue
+                    block_tensor = block_cache[block_id]
+                    if block_tensor is None or block_tensor.numel() == 0:
+                        continue
 
-                refresh_len = min(block_len, int(block_tensor.shape[0]))
-                if refresh_len <= 0:
-                    continue
+                    refresh_len = min(block_len, int(block_tensor.shape[0]))
+                    if refresh_len <= 0:
+                        continue
 
-                refresh_slice = slice(target_slice.start, target_slice.start + refresh_len)
-                block_gpu = block_tensor[:refresh_len].to(self.device, non_blocking=True)
-                target_buffer.xyz[refresh_slice] = block_gpu[:, 0:3]
-                target_buffer.scaling[refresh_slice] = block_gpu[:, 3:6]
-                target_buffer.rotation[refresh_slice] = block_gpu[:, 6:10]
-                target_buffer.opacity[refresh_slice] = block_gpu[:, 10:11]
-                target_buffer.features_dc[refresh_slice] = block_gpu[:, 11:14]
-                target_buffer.features_rest[refresh_slice] = block_gpu[:, 14:59]
-                refreshed += 1
+                    refresh_slice = slice(target_slice.start, target_slice.start + refresh_len)
+                    block_gpu = block_tensor[:refresh_len].to(self.device, non_blocking=True)
+                    target_buffer.xyz[refresh_slice] = block_gpu[:, 0:3]
+                    target_buffer.scaling[refresh_slice] = block_gpu[:, 3:6]
+                    target_buffer.rotation[refresh_slice] = block_gpu[:, 6:10]
+                    target_buffer.opacity[refresh_slice] = block_gpu[:, 10:11]
+                    target_buffer.features_dc[refresh_slice] = block_gpu[:, 11:14]
+                    target_buffer.features_rest[refresh_slice] = block_gpu[:, 14:59]
+                    refreshed += 1
+            finally:
+                torch.cuda.nvtx.range_pop()
 
             if refreshed > 0:
-                self.prefetch_complete_event.record(self.prefetch_stream)
+                with self.lock:
+                    paper_job = self._paper_prefetch_job
+                    paper_complete_event = (
+                        paper_job.complete_event
+                        if paper_job is not None
+                        and paper_job.target_buffer_idx == (
+                            1 - self.active_buffer_idx if target == 'loading' else self.active_buffer_idx
+                        )
+                        and paper_job.error is None
+                        else None
+                    )
+                if paper_complete_event is not None:
+                    paper_complete_event.record(self.prefetch_stream)
+                else:
+                    self.prefetch_complete_event.record(self.prefetch_stream)
 
         return refreshed
 
@@ -555,6 +851,40 @@ class DoubleBufferGPUWorkingSet:
         Returns:
             True if prefetch was ready, False if had to wait
         """
+        with self.lock:
+            paper_job = self._paper_prefetch_job
+            if paper_job is not None and paper_job.iteration == int(iteration):
+                job = paper_job
+            else:
+                job = None
+
+        if job is not None:
+            wait_start = time.perf_counter()
+            job.host_done.wait()
+            if job.error is not None:
+                self.prefetch_stream.synchronize()
+                self._buffer_at(job.target_buffer_idx).clear()
+                with self.lock:
+                    self._paper_prefetch_job = None
+                    self.prefetch_in_progress = False
+                    self.prefetch_iteration = -1
+                    self.stats['prefetch_misses'] += 1
+                    self.stats['activation_wait_ms'] += (
+                        time.perf_counter() - wait_start
+                    ) * 1000.0
+                return False
+
+            job.complete_event.synchronize()
+            with self.lock:
+                self._paper_prefetch_job = None
+                self.prefetch_in_progress = False
+                self.prefetch_iteration = -1
+                self.stats['prefetch_hits'] += 1
+                self.stats['activation_wait_ms'] += (
+                    time.perf_counter() - wait_start
+                ) * 1000.0
+            return True
+
         with self.lock:
             if not self.prefetch_in_progress:
                 self.stats['prefetch_misses'] += 1

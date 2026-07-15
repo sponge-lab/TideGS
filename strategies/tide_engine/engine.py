@@ -984,6 +984,7 @@ def clm_offload_train_one_batch(
     has_unified_params = hasattr(gaussians, "_unified_params") and gaussians._unified_params is not None
     use_fast_ram_ssd_path = storage_adapter is not None and has_unified_params and ssd_execution_mode == "fast_ram"
     is_paper_ssd_mode = storage_adapter is not None and ssd_execution_mode == "paper"
+    paper_async_prefetch_started = False
     paper_debug_logging = _paper_debug_logging_enabled(args, is_paper_ssd_mode)
     paper_optimizer_deferred_mode, paper_optimizer_backend = _initialize_paper_mode_runtime_state(
         gaussians=gaussians,
@@ -1872,17 +1873,28 @@ def clm_offload_train_one_batch(
                         future_submitted_late = 0
                         future_submitted = 0
                         next_blocks_ram = storage_adapter.cache.prefetch(next_resident_blocks)
-                    double_buffer.start_prefetch(
-                        iteration=iteration + bsz,
-                        visible_block_ids=next_resident_blocks,
-                        filters_global=[],
-                        ram_cache={},
-                        block_cache=next_blocks_ram if active_block_reader is None else None,
-                        resident_block_ids=paper_block_sets['keep_resident_blocks'],
-                        evicted_block_ids=paper_block_sets['evict_blocks'],
-                        allow_resident_copy=True,
-                        block_reader=active_block_reader,
-                    )
+                    if active_block_reader is not None:
+                        double_buffer.start_paper_prefetch(
+                            iteration=iteration + bsz,
+                            visible_block_ids=next_resident_blocks,
+                            filters_global=[],
+                            resident_block_ids=paper_block_sets['keep_resident_blocks'],
+                            evicted_block_ids=paper_block_sets['evict_blocks'],
+                            block_reader=active_block_reader,
+                        )
+                        paper_async_prefetch_started = True
+                    else:
+                        double_buffer.start_prefetch(
+                            iteration=iteration + bsz,
+                            visible_block_ids=next_resident_blocks,
+                            filters_global=[],
+                            ram_cache={},
+                            block_cache=next_blocks_ram,
+                            resident_block_ids=paper_block_sets['keep_resident_blocks'],
+                            evicted_block_ids=paper_block_sets['evict_blocks'],
+                            allow_resident_copy=True,
+                            block_reader=None,
+                        )
                     if should_log_paper_sets:
                         _log_delta_stream_prefetch(
                             iteration=iteration,
@@ -1915,7 +1927,10 @@ def clm_offload_train_one_batch(
     else:
         gaussians.signal_tensor_pinned.zero_()
     signal_tensor_pinned = gaussians.signal_tensor_pinned
-    torch.cuda.synchronize()
+    if is_paper_ssd_mode and paper_async_prefetch_started:
+        torch.cuda.current_stream().synchronize()
+    else:
+        torch.cuda.synchronize()
 
     microbatch_idx = 0
 
@@ -2850,6 +2865,14 @@ def clm_offload_train_one_batch(
     # ------------------------------------------------------------------------
     # 5.1: Optimizer step (mode-dependent)
     # ------------------------------------------------------------------------
+    if is_paper_ssd_mode and paper_async_prefetch_started and paper_block_sets is not None:
+        double_buffer = get_double_buffer_gpu(
+            num_total=total_n_gaussians,
+            block_size=args.gaussian_block_size,
+            device='cuda',
+        )
+        double_buffer.wait_for_paper_omega_before_update(iteration + bsz)
+
     if not gaussians.use_gpu_features:
         raise RuntimeError("Pure SSD release path requires GPU working-set features.")
 
@@ -3021,6 +3044,24 @@ def clm_offload_train_one_batch(
 
             if is_paper_ssd_mode:
                 keep_resident_blocks = list(paper_block_sets['keep_resident_blocks']) if paper_block_sets is not None else []
+                refresh_prefetched_omega = True
+                if keep_resident_blocks and paper_async_prefetch_started:
+                    double_buffer = get_double_buffer_gpu(
+                        num_total=total_n_gaussians,
+                        block_size=args.gaussian_block_size,
+                        device='cuda',
+                    )
+                    refresh_prefetched_omega = double_buffer.wait_for_paper_host_enqueue(
+                        iteration + bsz
+                    )
+                    if not refresh_prefetched_omega:
+                        prefetch_error = double_buffer.get_paper_prefetch_error(iteration + bsz)
+                        if prefetch_error is not None:
+                            _log_ab_buffer_prefetch_failure(
+                                iteration=iteration,
+                                error=prefetch_error,
+                                log_file=log_file,
+                            )
                 staged_writeback_blocks, refreshed_omega, candidate_blocks = _apply_paper_writeback_payload(
                     storage_adapter=storage_adapter,
                     args=args,
@@ -3028,6 +3069,7 @@ def clm_offload_train_one_batch(
                     current_iteration=iteration,
                     updated_block_ids=updated_block_ids,
                     omega_blocks=keep_resident_blocks,
+                    refresh_omega=refresh_prefetched_omega,
                     total_n_gaussians=total_n_gaussians,
                     original_xyz=original_xyz,
                     original_scaling=original_scaling,

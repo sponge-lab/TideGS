@@ -8,6 +8,8 @@ Manages the CPU RAM layer between GPU and SSD:
 - Intelligent prefetching and eviction
 """
 
+from __future__ import annotations
+
 import threading
 import time
 from collections import OrderedDict
