@@ -85,6 +85,14 @@ class FakeStorageAdapter:
         self.cache = FakeCache(stats)
 
 
+class FakeDoubleBufferStats:
+    def __init__(self, **stats):
+        self.stats = dict(stats)
+
+    def get_stats(self):
+        return dict(self.stats)
+
+
 def make_stats(**overrides):
     stats = {
         "cache_size": 10,
@@ -263,6 +271,7 @@ class MetricsBatchTest(unittest.TestCase):
                 storage_adapter=FakeStorageAdapter(make_stats()),
                 model_path=tmp,
                 batch_size=16,
+                double_buffer=FakeDoubleBufferStats(),
                 paper_stage_metrics={
                     "resident_capacity": 8,
                     "r_t_size": 6,
@@ -299,6 +308,16 @@ class MetricsBatchTest(unittest.TestCase):
                 )),
                 model_path=tmp,
                 batch_size=16,
+                double_buffer=FakeDoubleBufferStats(
+                    total_prefetch_time_ms=9.0,
+                    prefetch_hits=1,
+                    prefetch_misses=2,
+                    async_submit_ms=1.5,
+                    host_read_wait_ms=4.0,
+                    writeback_tail_wait_ms=2.0,
+                    activation_wait_ms=0.5,
+                    prefetch_failures=1,
+                ),
                 paper_stage_metrics={
                     "resident_capacity": 8,
                     "r_t_size": 7,
@@ -333,6 +352,14 @@ class MetricsBatchTest(unittest.TestCase):
             self.assertEqual(rows[1]["inflight_wait_blocks_delta"], "3.000000")
             self.assertEqual(rows[1]["inflight_fallback_blocks_delta"], "1.000000")
             self.assertEqual(rows[1]["inflight_wait_time_ms_delta"], "12.000000")
+            self.assertEqual(rows[1]["n1_db_prefetch_time_ms_delta"], "9.000000")
+            self.assertEqual(rows[1]["n1_prefetch_hits_delta"], "1.000000")
+            self.assertEqual(rows[1]["n1_prefetch_misses_delta"], "2.000000")
+            self.assertEqual(rows[1]["n1_async_submit_ms_delta"], "1.500000")
+            self.assertEqual(rows[1]["n1_host_read_wait_ms_delta"], "4.000000")
+            self.assertEqual(rows[1]["n1_writeback_tail_wait_ms_delta"], "2.000000")
+            self.assertEqual(rows[1]["n1_activation_wait_ms_delta"], "0.500000")
+            self.assertEqual(rows[1]["n1_prefetch_failures_delta"], "1.000000")
             self.assertEqual(rows[1]["future_read_blocks_vs_rt"], "0.500000")
             self.assertEqual(rows[1]["future_read_blocks_vs_cap"], "0.500000")
             self.assertEqual(rows[1]["resident_capacity"], "8")

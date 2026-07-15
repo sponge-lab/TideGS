@@ -1506,6 +1506,14 @@ METRICS_BATCH_FIELDS = [
     "setup_ms",
     "ssd_cull_load_ms",
     "n1_prefetch_ms",
+    "n1_db_prefetch_time_ms_delta",
+    "n1_prefetch_hits_delta",
+    "n1_prefetch_misses_delta",
+    "n1_async_submit_ms_delta",
+    "n1_host_read_wait_ms_delta",
+    "n1_writeback_tail_wait_ms_delta",
+    "n1_activation_wait_ms_delta",
+    "n1_prefetch_failures_delta",
     "gauss_cull_excl_n1_ms",
     "train_ms",
     "optim_ms",
@@ -1582,6 +1590,14 @@ def _metrics_batch_reset(cur: Dict[str, Any], prev: Optional[Dict[str, Any]]) ->
         "inflight_wait_blocks",
         "inflight_fallback_blocks",
         "inflight_wait_time_ms",
+        "db_prefetch_time_ms",
+        "db_prefetch_hits",
+        "db_prefetch_misses",
+        "db_async_submit_ms",
+        "db_host_read_wait_ms",
+        "db_writeback_tail_wait_ms",
+        "db_activation_wait_ms",
+        "db_prefetch_failures",
     )
     return any(
         _safe_float_value(cur.get(field)) < _safe_float_value(prev.get(field))
@@ -1610,6 +1626,7 @@ def write_paper_metrics_batch(
     model_path: str,
     batch_size: int,
     paper_stage_metrics: Optional[Dict[str, Any]] = None,
+    double_buffer=None,
     log_file=None,
 ) -> None:
     if not model_path:
@@ -1618,6 +1635,11 @@ def write_paper_metrics_batch(
     try:
         bsz = max(1, int(batch_size or 1))
         metrics = snapshot_paper_warm_layer_metrics(storage_adapter) or {}
+        double_buffer_stats = (
+            double_buffer.get_stats()
+            if double_buffer is not None and hasattr(double_buffer, "get_stats")
+            else {}
+        )
         stage_metrics = paper_stage_metrics or {}
         batch_path = os.path.join(model_path, "metrics_batch.tsv")
         os.makedirs(model_path, exist_ok=True)
@@ -1648,6 +1670,14 @@ def write_paper_metrics_batch(
             "inflight_wait_blocks": int(metrics.get("inflight_wait_blocks", 0)),
             "inflight_fallback_blocks": int(metrics.get("inflight_fallback_blocks", 0)),
             "inflight_wait_time_ms": float(metrics.get("inflight_wait_time_ms", 0.0)),
+            "db_prefetch_time_ms": float(double_buffer_stats.get("total_prefetch_time_ms", 0.0)),
+            "db_prefetch_hits": int(double_buffer_stats.get("prefetch_hits", 0)),
+            "db_prefetch_misses": int(double_buffer_stats.get("prefetch_misses", 0)),
+            "db_async_submit_ms": float(double_buffer_stats.get("async_submit_ms", 0.0)),
+            "db_host_read_wait_ms": float(double_buffer_stats.get("host_read_wait_ms", 0.0)),
+            "db_writeback_tail_wait_ms": float(double_buffer_stats.get("writeback_tail_wait_ms", 0.0)),
+            "db_activation_wait_ms": float(double_buffer_stats.get("activation_wait_ms", 0.0)),
+            "db_prefetch_failures": int(double_buffer_stats.get("prefetch_failures", 0)),
         }
         key = os.path.abspath(batch_path)
         prev_counters = _metrics_batch_prev.get(key)
@@ -1727,6 +1757,14 @@ def write_paper_metrics_batch(
             "setup_ms": _calc_stage_time_ms(perf_times, "iter_start", "stage1_setup_done"),
             "ssd_cull_load_ms": _calc_stage_time_ms(perf_times, "stage1_setup_done", "stage1_5_ssd_done"),
             "n1_prefetch_ms": n1_prefetch_ms,
+            "n1_db_prefetch_time_ms_delta": delta("db_prefetch_time_ms"),
+            "n1_prefetch_hits_delta": delta("db_prefetch_hits"),
+            "n1_prefetch_misses_delta": delta("db_prefetch_misses"),
+            "n1_async_submit_ms_delta": delta("db_async_submit_ms"),
+            "n1_host_read_wait_ms_delta": delta("db_host_read_wait_ms"),
+            "n1_writeback_tail_wait_ms_delta": delta("db_writeback_tail_wait_ms"),
+            "n1_activation_wait_ms_delta": delta("db_activation_wait_ms"),
+            "n1_prefetch_failures_delta": delta("db_prefetch_failures"),
             "gauss_cull_excl_n1_ms": max(0.0, gauss_cull_legacy_ms - n1_prefetch_ms),
             "train_ms": _calc_stage_time_ms(perf_times, "stage2_3_culling_done", "stage4_train_done"),
             "optim_ms": _calc_stage_time_ms(perf_times, "stage5_optim_start", "stage5_optim_done"),
