@@ -1000,6 +1000,14 @@ def log_double_buffer_stats(
     log_file.write(f"  Hit rate: {stats['hit_rate']*100:.1f}%\n")
     log_file.write(f"  Avg prefetch time: {stats['avg_prefetch_time_ms']:.1f}ms\n")
     log_file.write(
+        "  Paper async: "
+        f"submit={stats.get('async_submit_ms', 0.0):.1f}ms "
+        f"host_read_wait={stats.get('host_read_wait_ms', 0.0):.1f}ms "
+        f"writeback_tail_wait={stats.get('writeback_tail_wait_ms', 0.0):.1f}ms "
+        f"activation_wait={stats.get('activation_wait_ms', 0.0):.1f}ms "
+        f"failures={stats.get('prefetch_failures', 0)}\n"
+    )
+    log_file.write(
         f"  Active buffer: {stats['active_buffer']}, Gaussians: {stats['active_gaussians']:,}\n"
     )
 
@@ -1252,6 +1260,7 @@ def apply_paper_writeback_payload(
     current_iteration: int,
     updated_block_ids,
     omega_blocks,
+    refresh_omega: bool = True,
     total_n_gaussians: int,
     original_xyz,
     original_scaling,
@@ -1313,7 +1322,7 @@ def apply_paper_writeback_payload(
     staged_writeback_blocks = storage_adapter.sync_cache_from_cpu_views(updated_blocks_dict)
 
     refreshed_omega = 0
-    if len(omega_blocks) > 0:
+    if refresh_omega and len(omega_blocks) > 0:
         omega_refresh_blocks = {
             block_id: updated_blocks_dict[block_id]
             for block_id in omega_blocks
