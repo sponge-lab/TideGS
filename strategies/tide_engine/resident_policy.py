@@ -245,6 +245,30 @@ def _resolve_balanced_seed_capacity(
     return min(int(capacity), quota)
 
 
+def _validate_resident_transition_sets(
+    current_resident_set: Set[int],
+    next_resident_set: Set[int],
+    keep_resident_blocks: List[int],
+    stream_in_blocks: List[int],
+    evict_blocks: List[int],
+    capacity: int,
+) -> None:
+    keep = set(keep_resident_blocks)
+    stream_in = set(stream_in_blocks)
+    evict = set(evict_blocks)
+    if keep & stream_in or keep & evict or stream_in & evict:
+        raise RuntimeError("resident transition keep/stream-in/evict sets overlap")
+    if keep | stream_in != next_resident_set:
+        raise RuntimeError("resident transition keep/stream-in sets do not form next resident set")
+    if keep | evict != current_resident_set:
+        raise RuntimeError("resident transition keep/evict sets do not form current resident set")
+    if len(next_resident_set) > int(capacity):
+        raise RuntimeError(
+            "resident transition exceeded capacity: "
+            f"resident={len(next_resident_set)}, capacity={int(capacity)}"
+        )
+
+
 def compute_passthrough_resident_transition(
     current_active_blocks: List[int],
     next_active_blocks: List[int],
@@ -322,6 +346,7 @@ def compute_topc_resident_transition(
     resident_capacity_blocks: int = -1,
     balanced_camera_seeds: bool = False,
     balanced_seed_fraction: float = 1.0,
+    enforce_next_active_coverage: bool = False,
 ) -> ResidentTransition:
     current_active = _sorted_unique_ints(current_active_blocks)
     next_active = _sorted_unique_ints(next_active_blocks)
@@ -361,8 +386,15 @@ def compute_topc_resident_transition(
         block_id,
     )
 
+    selection_candidates = candidate_blocks
+    next_active_fits = len(next_active_set) <= effective_capacity
+    if enforce_next_active_coverage and not next_active_fits:
+        selection_candidates = next_active
+
     camera_seed_blocks: List[int] = []
-    if balanced_camera_seeds and effective_capacity > 0:
+    if balanced_camera_seeds and effective_capacity > 0 and not (
+        enforce_next_active_coverage and next_active_fits
+    ):
         seed_capacity = _resolve_balanced_seed_capacity(
             camera_blocks=next_camera_blocks,
             candidate_blocks=next_active_set,
@@ -377,13 +409,16 @@ def compute_topc_resident_transition(
             capacity=seed_capacity,
         )
 
-    selected_blocks = list(camera_seed_blocks)
+    if enforce_next_active_coverage and next_active_fits:
+        selected_blocks = list(next_active)
+    else:
+        selected_blocks = list(camera_seed_blocks)
     selected_set = set(selected_blocks)
     remaining_capacity = max(0, effective_capacity - len(selected_blocks))
     if remaining_capacity > 0:
         selected_blocks.extend([
             block_id
-            for block_id in sorted(candidate_blocks, key=ranking_key)
+            for block_id in sorted(selection_candidates, key=ranking_key)
             if block_id not in selected_set
         ][:remaining_capacity])
     selected_blocks = selected_blocks[:effective_capacity]
@@ -391,8 +426,6 @@ def compute_topc_resident_transition(
     optional_selected_blocks = sorted(
         block_id for block_id in selected_blocks if block_id not in next_active_set
     )
-    enforce_next_active_coverage = False
-
     next_resident = sorted(next_resident_set)
 
     keep_resident_blocks = sorted(current_resident_set & next_resident_set)
@@ -410,6 +443,27 @@ def compute_topc_resident_transition(
         next_resident_set,
         next_active_set,
     )
+    _validate_resident_transition_sets(
+        current_resident_set,
+        next_resident_set,
+        keep_resident_blocks,
+        stream_in_blocks,
+        evict_blocks,
+        effective_capacity,
+    )
+    if enforce_next_active_coverage:
+        expected_active_coverage = min(len(next_active_set), effective_capacity)
+        actual_active_coverage = len(next_active_set & next_resident_set)
+        if actual_active_coverage != expected_active_coverage:
+            raise RuntimeError(
+                "active-first resident selection violated next-active coverage: "
+                f"expected={expected_active_coverage}, actual={actual_active_coverage}"
+            )
+        if len(next_active_set) >= effective_capacity and optional_selected_blocks:
+            raise RuntimeError(
+                "active-first resident selection retained stale blocks while next-active "
+                "blocks filled the resident capacity"
+            )
 
     return ResidentTransition(
         current_active_blocks=current_active,
@@ -424,7 +478,15 @@ def compute_topc_resident_transition(
         active_delta_plus_blocks=active_delta_plus_blocks,
         active_delta_minus_blocks=active_delta_minus_blocks,
         next_camera_ids=list(next_camera_ids or []),
-            resident_selection_policy="topc_balanced" if balanced_camera_seeds else "topc_strict",
+        resident_selection_policy=(
+            "topc_balanced_active_first"
+            if balanced_camera_seeds and enforce_next_active_coverage
+            else "topc_strict_active_first"
+            if enforce_next_active_coverage
+            else "topc_balanced"
+            if balanced_camera_seeds
+            else "topc_strict"
+        ),
         resident_capacity_blocks=effective_capacity,
         requested_resident_capacity_blocks=requested_capacity,
         current_resident_source=current_resident_source,

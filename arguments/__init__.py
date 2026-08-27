@@ -200,7 +200,7 @@ class AuxiliaryParams(ParamGroup):
         self.enable_hotspot_retention = True  # Enable GPU hotspot retention to reduce RAM→GPU bandwidth
         self.ssd_execution_mode = "fast_ram"  # {fast_ram, paper}; TideGS routes reads through the SSD→RAM cache path
         self.paper_optimizer_deferred_mode = "off"  # {off, same_iter, cross_iter}; optimizer/writeback defer mode
-        self.paper_resident_selection_policy = "topc_balanced"  # {passthrough_active_set, topc_strict, topc_balanced}; resident-set selection policy
+        self.paper_resident_selection_policy = "topc_balanced_active_first"  # Validated default; topc_balanced remains for legacy reproduction.
         self.paper_resident_lambda = 0.3  # Eq.(5) mixing weight for next-step usefulness vs. recency
         self.paper_resident_recency_decay = 0.95  # multiplicative aging factor for resident recency
         self.paper_balanced_seed_fraction = 0.25  # topc_balanced camera-seed capacity fraction
@@ -485,9 +485,15 @@ def init_args(args):
         args.paper_resident_selection_policy = str(args.paper_resident_selection_policy).lower()
         if args.paper_resident_selection_policy == "topc":
             args.paper_resident_selection_policy = "topc_strict"
-        assert args.paper_resident_selection_policy in {"passthrough_active_set", "topc_strict", "topc_balanced"}, (
+        assert args.paper_resident_selection_policy in {
+            "passthrough_active_set",
+            "topc_strict",
+            "topc_balanced",
+            "topc_strict_active_first",
+            "topc_balanced_active_first",
+        }, (
             "Invalid paper_resident_selection_policy="
-            f"{args.paper_resident_selection_policy!r}; expected one of passthrough_active_set, topc_strict, topc_balanced"
+            f"{args.paper_resident_selection_policy!r}; expected a supported TopC policy"
         )
     if hasattr(args, "paper_resident_lambda"):
         args.paper_resident_lambda = float(args.paper_resident_lambda)
@@ -704,8 +710,13 @@ def init_args(args):
         assert getattr(args, "paper_optimizer_deferred_mode", "off") == "off", (
             "pure SSD offload requires --paper_optimizer_deferred_mode off"
         )
-        assert getattr(args, "paper_resident_selection_policy", "passthrough_active_set") in {"topc_strict", "topc_balanced"}, (
-            "pure SSD offload requires --paper_resident_selection_policy topc_strict or topc_balanced"
+        assert getattr(args, "paper_resident_selection_policy", "passthrough_active_set") in {
+            "topc_strict",
+            "topc_balanced",
+            "topc_strict_active_first",
+            "topc_balanced_active_first",
+        }, (
+            "pure SSD offload requires a TopC resident selection policy"
         )
         assert getattr(args, "paper_resident_capacity_blocks", -1) > 0, (
             "pure SSD offload requires a positive --paper_resident_capacity_blocks so VRAM residency is explicitly bounded"

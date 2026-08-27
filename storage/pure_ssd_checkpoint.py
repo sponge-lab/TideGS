@@ -23,6 +23,48 @@ PARAM_DIM = 59
 CHECKPOINT_MANIFEST = "pure_ssd_checkpoint.json"
 
 
+def build_resident_policy_config(args) -> Dict[str, Any]:
+    return {
+        "selection_policy": str(
+            getattr(args, "paper_resident_selection_policy", "")
+        ).lower(),
+        "capacity_blocks": int(
+            getattr(args, "paper_resident_capacity_blocks", -1)
+        ),
+        "lambda": float(getattr(args, "paper_resident_lambda", 0.3)),
+        "recency_decay": float(
+            getattr(args, "paper_resident_recency_decay", 0.95)
+        ),
+        "balanced_seed_fraction": float(
+            getattr(args, "paper_balanced_seed_fraction", 0.25)
+        ),
+    }
+
+
+def resident_policy_resume_message(manifest: Dict[str, Any], args) -> str:
+    current = build_resident_policy_config(args)
+    saved = manifest.get("resident_policy")
+    if not isinstance(saved, dict):
+        return (
+            "[TIDE RESIDENT POLICY] checkpoint has no resident-policy metadata; "
+            f"using current configuration {json.dumps(current, sort_keys=True)}"
+        )
+
+    differences = [
+        key for key, current_value in current.items()
+        if saved.get(key) != current_value
+    ]
+    status = "override" if differences else "match"
+    message = (
+        f"[TIDE RESIDENT POLICY] checkpoint/current {status}: "
+        f"saved={json.dumps(saved, sort_keys=True)} "
+        f"current={json.dumps(current, sort_keys=True)}"
+    )
+    if differences:
+        message += f" changed={','.join(differences)}"
+    return message
+
+
 def _log(message: str, log_file=None) -> None:
     print(message)
     if log_file is not None:
@@ -302,6 +344,7 @@ def write_pure_ssd_snapshot_checkpoint(
         "training_state": str(training_state_file.resolve()),
         "scene_min": np.asarray(scene_min, dtype=np.float32).tolist(),
         "scene_max": np.asarray(scene_max, dtype=np.float32).tolist(),
+        "resident_policy": build_resident_policy_config(args),
         "args": {
             "ssd_execution_mode": getattr(args, "ssd_execution_mode", None),
             "paper_optimizer_backend": getattr(args, "paper_optimizer_backend", None),
@@ -440,6 +483,7 @@ def write_pure_ssd_incremental_checkpoint(
         "training_state": str(training_state_file.resolve()),
         "scene_min": np.asarray(scene_min, dtype=np.float32).tolist(),
         "scene_max": np.asarray(scene_max, dtype=np.float32).tolist(),
+        "resident_policy": build_resident_policy_config(args),
         "args": {
             "ssd_execution_mode": getattr(args, "ssd_execution_mode", None),
             "paper_optimizer_backend": getattr(args, "paper_optimizer_backend", None),

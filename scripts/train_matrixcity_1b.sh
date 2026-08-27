@@ -41,7 +41,7 @@ CHECKPOINT_KEEP_LAST=2
 MAX_PATCH_FILES=16
 MAX_PATCH_GB=64
 MIN_FREE_GB=64
-RESIDENT_POLICY="topc_balanced"
+RESIDENT_POLICY="topc_balanced_active_first"
 RESIDENT_LAMBDA_LIST="0.3"
 RESIDENT_DECAY_LIST="0.95"
 BALANCED_SEED_FRACTION_LIST="0.25"
@@ -88,7 +88,7 @@ Options:
   --max-patch-files N         Compact at this active patch count (default: ${MAX_PATCH_FILES})
   --max-patch-gb N            Compact at this stale patch size in GiB (default: ${MAX_PATCH_GB})
   --min-free-gb N             Refuse writes that consume this free-space reserve (default: ${MIN_FREE_GB})
-  --resident-policy POLICY    topc_strict|topc_balanced (default: ${RESIDENT_POLICY})
+  --resident-policy POLICY    TopC policy (default: ${RESIDENT_POLICY})
   --resident-lambda VALUE     Single resident-set mixing weight
   --resident-decay VALUE      Single resident recency decay value
   --balanced-seed-fraction VALUE
@@ -189,7 +189,7 @@ case "${CHECKPOINT_PATCH_MODE}" in
   *) echo "Invalid --checkpoint-patch-mode '${CHECKPOINT_PATCH_MODE}'" >&2; exit 1 ;;
 esac
 case "${RESIDENT_POLICY}" in
-  topc_strict|topc_balanced) ;;
+  topc_strict|topc_balanced|topc_strict_active_first|topc_balanced_active_first) ;;
   *) echo "Invalid --resident-policy '${RESIDENT_POLICY}'" >&2; usage >&2; exit 1 ;;
 esac
 case "${DEBUG_CAMERA_SAMPLE_MODE}" in

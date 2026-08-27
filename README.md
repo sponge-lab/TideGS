@@ -165,7 +165,7 @@ bash scripts/train_matrixcity_1b.sh \
   --bsz 16 \
   --capacity 2048 \
   --schedule-ordering trajectory \
-  --resident-policy topc_balanced \
+  --resident-policy topc_balanced_active_first \
   --resident-lambda 0.3 \
   --resident-decay 0.95 \
   --balanced-seed-fraction 0.25 \
@@ -193,7 +193,7 @@ Recommended MatrixCity 1B settings:
 batch size: 16
 resident block capacity: 2048
 schedule ordering: trajectory
-resident policy: balanced TopC
+resident policy: balanced active-first TopC (topc_balanced_active_first)
 resident lambda: 0.3
 recency decay: 0.95
 balanced seed fraction: 0.25
@@ -201,6 +201,8 @@ projection camera chunk: 2
 RAM cache budget: 32 GB
 checkpoint mode: incremental
 ```
+
+The legacy `topc_balanced` policy remains available for reproducing earlier runs.
 
 ## Checkpoint And Resume
 

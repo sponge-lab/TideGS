@@ -45,6 +45,7 @@ from storage.pure_ssd_checkpoint import (
     is_pure_ssd_checkpoint,
     load_pure_ssd_checkpoint_manifest,
     prune_checkpoint_history,
+    resident_policy_resume_message,
     write_pure_ssd_incremental_checkpoint,
     write_pure_ssd_snapshot_checkpoint,
 )
@@ -201,6 +202,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         )
         utils.print_rank_0(resume_msg)
         log_file.write(resume_msg + "\n")
+        policy_msg = resident_policy_resume_message(pure_ssd_resume_manifest, args)
+        utils.print_rank_0(policy_msg)
+        log_file.write(policy_msg + "\n")
 
     # Configure multiprocessing sharing strategy if needed
     if args.sharing_strategy != "default":
