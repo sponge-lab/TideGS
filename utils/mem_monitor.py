@@ -16,15 +16,25 @@ import psutil
 
 
 class MemMonitor:
-    """Write one CSV row per tick with RSS / available / total."""
+    """Write one CSV row per tick with RSS / available / total.
+
+    USS (``memory_full_info``) walks ``/proc/<pid>/smaps`` and costs seconds on a
+    process with hundreds of GB of mapped memory, so it is sampled only every
+    ``uss_every`` ticks (``0`` disables it); the last sampled value is repeated in
+    between.  RSS, tree RSS and system memory are cheap and stay per tick.
+    """
 
     def __init__(self, log_dir: str, warn_avail_gb: float = 15.0,
-                 flush_every: int = 10, track_children: bool = True):
+                 flush_every: int = 10, track_children: bool = True,
+                 uss_every: int = 100):
         self._proc = psutil.Process()
         self._warn_avail = warn_avail_gb
         self._flush_every = flush_every
         self._trackchildren = track_children
+        self._uss_every = max(0, int(uss_every))
+        self._last_uss_gb = float("nan")
         self._cnt = 0
+        self._closed = False
 
         path = os.path.join(log_dir, "mem_monitor.csv")
         self._fp = open(path, "w", newline="")
@@ -36,7 +46,7 @@ class MemMonitor:
             "num_children"
         ])
         self._t0 = time.time()
-    
+
     def _sum_tree_rss_bytes(self) -> (int, int):
         """Return (tree_rss_bytes, num_children)."""
         mi = self._proc.memory_info()
@@ -44,12 +54,12 @@ class MemMonitor:
         nchild = 0
         if not self._trackchildren:
             return rss, nchild
-        
+
         try:
             children = self._proc.children(recursive=True)
         except psutil.Error:
             children = []
-        
+
         for ch in children:
             try:
                 rss += ch.memory_info().rss
@@ -57,6 +67,13 @@ class MemMonitor:
             except psutil.Error:
                 continue
         return rss, nchild
+
+    def _sample_uss_gb(self) -> float:
+        """Expensive (smaps walk); only called every ``uss_every`` ticks."""
+        try:
+            return self._proc.memory_full_info().uss / (1 << 30)
+        except (psutil.AccessDenied, AttributeError):
+            return float("nan")
 
     # ------------------------------------------------------------------ #
     def tick(self, iteration: int) -> None:
@@ -67,12 +84,10 @@ class MemMonitor:
         mi = self._proc.memory_info()
         rss_gb = mi.rss / (1 << 30)
 
-        # USS
-        try:
-            uss = self._proc.memory_full_info().uss
-            uss_gb = uss / (1 << 30)
-        except (psutil.AccessDenied, AttributeError):
-            uss_gb = float("nan")
+        # USS: sampled infrequently (see class docstring); repeat last value otherwise.
+        if self._uss_every > 0 and self._cnt % self._uss_every == 0:
+            self._last_uss_gb = self._sample_uss_gb()
+        uss_gb = self._last_uss_gb
 
         # Tree RSS (process + children)
         tree_rss, nchild = self._sum_tree_rss_bytes()
@@ -102,12 +117,20 @@ class MemMonitor:
             print(f"\n[MemMonitor] WARNING iter={iteration}: "
                   f"avail={avail_gb:.1f} GB < {self._warn_avail} GB  "
                   f"RSS={rss_gb:.1f} GB, Tree RSS={tree_rss_gb:.1f} GB, Swap used={swap_used_gb:.1f} GB "
-                  f"children={nchild}\n", 
+                  f"children={nchild}\n",
                   flush=True)
 
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        fp = getattr(self, "_fp", None)
+        if fp is None:
+            return
         try:
-            self._fp.flush()
+            if not fp.closed:
+                fp.flush()
         finally:
-            self._fp.close()
+            if not fp.closed:
+                fp.close()

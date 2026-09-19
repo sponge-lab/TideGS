@@ -25,7 +25,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import time
 
-from storage.schedule_utils import get_current_and_next_camera_batches
 
 try:
     import triton
@@ -663,6 +662,15 @@ class DoubleBufferGPUWorkingSet:
         Called at the start of each iteration AFTER prefetch is complete.
         """
         persistent_plan = self._persistent_plan
+        next_blocks = (
+            persistent_plan['next_order'] if persistent_plan is not None
+            else self.loading_buffer.loaded_blocks
+        )
+        missing_dirty = set(self.dirty_blocks()) - set(next_blocks)
+        if missing_dirty:
+            raise RuntimeError(
+                f"Cannot evict GPU-dirty blocks before writeback: {sorted(missing_dirty)[:8]}"
+            )
         if persistent_plan is not None:
             if self._before_persistent_apply is not None:
                 self._before_persistent_apply()
@@ -1171,9 +1179,6 @@ class DoubleBufferGPUWorkingSet:
         iteration: int,
         visible_block_ids: List[int],
         filters_global: Optional[List[torch.Tensor]] = None,
-        ram_cache: Optional[Dict[str, torch.Tensor]] = None,
-        unified_params: Optional[torch.Tensor] = None,
-        block_cache: Optional[Dict[int, torch.Tensor]] = None,
         resident_block_ids: Optional[List[int]] = None,
         evicted_block_ids: Optional[List[int]] = None,
         allow_resident_copy: bool = True,
@@ -1190,20 +1195,17 @@ class DoubleBufferGPUWorkingSet:
             iteration: The iteration this data is for (N+1)
             visible_block_ids: Block IDs needed for iteration N+1
             filters_global: Optional global Gaussian indices for each camera
-            ram_cache: [Fallback] Optional full RAM cache containing all parameters
-            unified_params: [Fallback] Optional _unified_params tensor (if using unified layout)
-            block_cache: [Fallback] Optional dict {block_id: tensor(block_size, 59)}
             resident_block_ids: Optional blocks to keep resident from the active buffer (Omega)
             evicted_block_ids: Optional blocks evicted from the current working set (Delta-)
             allow_resident_copy: Whether to reuse resident blocks from the active buffer
-            block_reader: Preferred source for block reads.  Must implement the
-                ``BlockReader`` protocol from ``storage.block_reader``.  When
-                provided, it supersedes the three fallback data-source arguments.
+            block_reader: Source for block reads implementing the ``BlockReader`` protocol.
             defer_resident_copy: Delay retained-block copying until the current
                 optimizer step has completed.
             before_target_reuse: Optional fence invoked by the worker immediately
                 before reusing the loading GPU buffer.
         """
+        if block_reader is None:
+            raise ValueError("Tide prefetch requires a block reader.")
         previous_iteration = None
         with self.lock:
             if self.prefetch_in_progress:
@@ -1223,287 +1225,72 @@ class DoubleBufferGPUWorkingSet:
             self._persistent_plan = None
             self._before_persistent_apply = None
 
-        if block_reader is not None:
-            sorted_visible_blocks = sorted(
-                set(int(block_id) for block_id in visible_block_ids)
-            )
-            resident_set = set(
-                int(block_id) for block_id in (resident_block_ids or [])
-            )
-            evicted_set = set(
-                int(block_id) for block_id in (evicted_block_ids or [])
-            )
-            persistent_plan = self._build_persistent_plan(
-                sorted_visible_blocks,
-                resident_set,
-                evicted_set,
-                allow_resident_copy=allow_resident_copy,
-                defer_resident_copy=defer_resident_copy,
-            )
-            if persistent_plan is not None:
-                self._persistent_plan = persistent_plan
-                self._before_persistent_apply = before_target_reuse
-                prefetch_blocks = persistent_plan['incoming_blocks']
-                prefetch_resident_set = set()
-                prefetch_evicted_set = evicted_set
-                prefetch_deferred = False
-                worker_before_target_reuse = None
-            else:
-                self.stats['persistent_ab_fallbacks'] += 1
-                prefetch_blocks = sorted_visible_blocks
-                prefetch_resident_set = resident_set
-                prefetch_evicted_set = evicted_set
-                prefetch_deferred = defer_resident_copy
-                worker_before_target_reuse = before_target_reuse
-            self._prefetch_future = self._prefetch_executor.submit(
-                self._run_block_reader_prefetch,
-                target_buffer=self.loading_buffer,
-                source_buffer=self.active_buffer,
-                sorted_visible_blocks=prefetch_blocks,
-                resident_set=prefetch_resident_set,
-                evicted_set=prefetch_evicted_set,
-                filters_global=list(filters_global or []),
-                allow_resident_copy=allow_resident_copy,
-                defer_resident_copy=prefetch_deferred,
-                block_reader=block_reader,
-                before_target_reuse=worker_before_target_reuse,
-            )
-            self._prefetch_future.add_done_callback(
-                lambda _future: self._target_layout_ready.set()
-            )
-            return
+        sorted_visible_blocks = sorted(
+            set(int(block_id) for block_id in visible_block_ids)
+        )
+        resident_set = set(
+            int(block_id) for block_id in (resident_block_ids or [])
+        )
+        evicted_set = set(
+            int(block_id) for block_id in (evicted_block_ids or [])
+        )
+        persistent_plan = self._build_persistent_plan(
+            sorted_visible_blocks,
+            resident_set,
+            evicted_set,
+            allow_resident_copy=allow_resident_copy,
+            defer_resident_copy=defer_resident_copy,
+        )
+        if persistent_plan is not None:
+            self._persistent_plan = persistent_plan
+            self._before_persistent_apply = before_target_reuse
+            prefetch_blocks = persistent_plan['incoming_blocks']
+            prefetch_resident_set = set()
+            prefetch_evicted_set = evicted_set
+            prefetch_deferred = False
+            worker_before_target_reuse = None
+        else:
+            self.stats['persistent_ab_fallbacks'] += 1
+            prefetch_blocks = sorted_visible_blocks
+            prefetch_resident_set = resident_set
+            prefetch_evicted_set = evicted_set
+            prefetch_deferred = defer_resident_copy
+            worker_before_target_reuse = before_target_reuse
+        self._prefetch_future = self._prefetch_executor.submit(
+            self._run_block_reader_prefetch,
+            target_buffer=self.loading_buffer,
+            source_buffer=self.active_buffer,
+            sorted_visible_blocks=prefetch_blocks,
+            resident_set=prefetch_resident_set,
+            evicted_set=prefetch_evicted_set,
+            filters_global=list(filters_global or []),
+            allow_resident_copy=allow_resident_copy,
+            defer_resident_copy=prefetch_deferred,
+            block_reader=block_reader,
+            before_target_reuse=worker_before_target_reuse,
+        )
+        self._prefetch_future.add_done_callback(
+            lambda _future: self._target_layout_ready.set()
+        )
+        return
 
-        with torch.cuda.stream(self.prefetch_stream):
-            start_time = time.time()
+    def synchronize_prefetch(self) -> None:
+        if self._resident_plan_future is not None:
+            self._resident_plan_future.result()
+        if self._prefetch_future is not None:
+            self._prefetch_future.result()
+        self.prefetch_stream.synchronize()
+        self.resident_refresh_stream.synchronize()
 
-            target_buffer = self.loading_buffer
-            source_buffer = self.active_buffer
-            target_buffer.clear()
-
-            sorted_visible_blocks = sorted(set(int(block_id) for block_id in visible_block_ids))
-            resident_set = set(int(block_id) for block_id in (resident_block_ids or []))
-            evicted_set = set(int(block_id) for block_id in (evicted_block_ids or []))
-            filters_global = filters_global or []
-
-            if len(sorted_visible_blocks) == 0:
-                target_buffer.evicted_blocks = sorted(evicted_set)
-                self._target_layout_ready.set()
-                self.prefetch_complete_event.record(self.prefetch_stream)
-                return
-
-            block_lengths: Dict[int, int] = {}
-            all_gaussian_ids_list: List[int] = []
-            num_visible = 0
-            for block_id in sorted_visible_blocks:
-                start_idx = block_id * self.block_size
-                end_idx = min(start_idx + self.block_size, self.num_total)
-                block_len = end_idx - start_idx
-                block_lengths[block_id] = block_len
-                num_visible += block_len
-                all_gaussian_ids_list.extend(range(start_idx, end_idx))
-
-            target_buffer.xyz = torch.empty(num_visible, 3, device=self.device, dtype=torch.float32)
-            target_buffer.scaling = torch.empty(num_visible, 3, device=self.device, dtype=torch.float32)
-            target_buffer.rotation = torch.empty(num_visible, 4, device=self.device, dtype=torch.float32)
-            target_buffer.opacity = torch.empty(num_visible, 1, device=self.device, dtype=torch.float32)
-            target_buffer.features_dc = torch.empty(num_visible, 3, device=self.device, dtype=torch.float32)
-            target_buffer.features_rest = torch.empty(num_visible, 45, device=self.device, dtype=torch.float32)
-
-            # Batch-resolve cold blocks via BlockReader up front (paper-correct path).
-            # Skip blocks that will be copied from the active buffer (resident in Omega).
-            reader_blocks: Optional[Dict[int, torch.Tensor]] = None
-            reader_layout = None
-            if block_reader is not None:
-                from storage.block_reader import BlockLayout
-                reader_layout = block_reader.layout
-                reader_cold_ids = [
-                    block_id for block_id in sorted_visible_blocks
-                    if not (
-                        allow_resident_copy
-                        and block_id in resident_set
-                        and source_buffer is not None
-                        and source_buffer.block_to_local_slice is not None
-                        and block_id in source_buffer.block_to_local_slice
-                        and not source_buffer.is_empty()
-                    )
-                ]
-                reader_blocks = block_reader.read_blocks(reader_cold_ids)
-
-            offset = 0
-            resident_blocks_used: List[int] = []
-            streamed_blocks_used: List[int] = []
-
-            for block_id in sorted_visible_blocks:
-                block_len = block_lengths[block_id]
-                start_idx = block_id * self.block_size
-                end_idx = min(start_idx + self.block_size, self.num_total)
-                target_slice = slice(offset, offset + block_len)
-                target_buffer.block_to_local_slice[block_id] = target_slice
-
-                can_copy_resident = (
-                    allow_resident_copy
-                    and block_id in resident_set
-                    and source_buffer is not None
-                    and source_buffer.block_to_local_slice is not None
-                    and block_id in source_buffer.block_to_local_slice
-                    and not source_buffer.is_empty()
-                )
-
-                if can_copy_resident:
-                    source_slice = source_buffer.block_to_local_slice[block_id]
-                    target_buffer.xyz[target_slice] = source_buffer.xyz[source_slice].detach()
-                    target_buffer.scaling[target_slice] = source_buffer.scaling[source_slice].detach()
-                    target_buffer.rotation[target_slice] = source_buffer.rotation[source_slice].detach()
-                    target_buffer.opacity[target_slice] = source_buffer.opacity[source_slice].detach()
-                    target_buffer.features_dc[target_slice] = source_buffer.features_dc[source_slice].detach()
-                    target_buffer.features_rest[target_slice] = source_buffer.features_rest[source_slice].detach()
-                    resident_blocks_used.append(block_id)
-                elif reader_blocks is not None and block_id in reader_blocks:
-                    from storage.block_reader import BlockLayout  # local import keeps fallback paths untouched
-                    block_tensor = reader_blocks[block_id][:block_len]
-                    block_gpu = block_tensor.to(self.device, non_blocking=True)
-                    if reader_layout == BlockLayout.UNIFIED:
-                        target_buffer.xyz[target_slice] = block_gpu[:, 0:3]
-                        target_buffer.opacity[target_slice] = block_gpu[:, 3:4]
-                        target_buffer.scaling[target_slice] = block_gpu[:, 4:7]
-                        target_buffer.rotation[target_slice] = block_gpu[:, 7:11]
-                        target_buffer.features_dc[target_slice] = block_gpu[:, 11:14]
-                        target_buffer.features_rest[target_slice] = block_gpu[:, 14:59]
-                    else:  # BlockLayout.CACHE
-                        target_buffer.xyz[target_slice] = block_gpu[:, 0:3]
-                        target_buffer.scaling[target_slice] = block_gpu[:, 3:6]
-                        target_buffer.rotation[target_slice] = block_gpu[:, 6:10]
-                        target_buffer.opacity[target_slice] = block_gpu[:, 10:11]
-                        target_buffer.features_dc[target_slice] = block_gpu[:, 11:14]
-                        target_buffer.features_rest[target_slice] = block_gpu[:, 14:59]
-                    streamed_blocks_used.append(block_id)
-                elif unified_params is not None:
-                    block_params = unified_params[start_idx:end_idx]
-                    target_buffer.xyz[target_slice] = block_params[:, 0:3].to(self.device, non_blocking=True)
-                    target_buffer.opacity[target_slice] = block_params[:, 3:4].to(self.device, non_blocking=True)
-                    target_buffer.scaling[target_slice] = block_params[:, 4:7].to(self.device, non_blocking=True)
-                    target_buffer.rotation[target_slice] = block_params[:, 7:11].to(self.device, non_blocking=True)
-                    target_buffer.features_dc[target_slice] = block_params[:, 11:14].to(self.device, non_blocking=True)
-                    target_buffer.features_rest[target_slice] = block_params[:, 14:59].to(self.device, non_blocking=True)
-                    streamed_blocks_used.append(block_id)
-                elif block_cache is not None:
-                    if block_id not in block_cache:
-                        raise KeyError(f"Block {block_id} missing from block_cache during double-buffer prefetch")
-                    block_tensor = block_cache[block_id][:block_len]
-                    block_gpu = block_tensor.to(self.device, non_blocking=True)
-                    target_buffer.xyz[target_slice] = block_gpu[:, 0:3]
-                    target_buffer.scaling[target_slice] = block_gpu[:, 3:6]
-                    target_buffer.rotation[target_slice] = block_gpu[:, 6:10]
-                    target_buffer.opacity[target_slice] = block_gpu[:, 10:11]
-                    target_buffer.features_dc[target_slice] = block_gpu[:, 11:14]
-                    target_buffer.features_rest[target_slice] = block_gpu[:, 14:59]
-                    streamed_blocks_used.append(block_id)
-                else:
-                    if ram_cache is None:
-                        raise ValueError('Either block_reader, unified_params, block_cache, or ram_cache must be provided')
-                    block_ids_cpu = torch.arange(start_idx, end_idx, dtype=torch.long)
-                    target_buffer.xyz[target_slice] = ram_cache['xyz'][block_ids_cpu].to(self.device, non_blocking=True)
-                    target_buffer.scaling[target_slice] = ram_cache['scaling'][block_ids_cpu].to(self.device, non_blocking=True)
-                    target_buffer.rotation[target_slice] = ram_cache['rotation'][block_ids_cpu].to(self.device, non_blocking=True)
-                    target_buffer.opacity[target_slice] = ram_cache['opacity'][block_ids_cpu].to(self.device, non_blocking=True)
-
-                    if 'features_dc' in ram_cache:
-                        target_buffer.features_dc[target_slice] = ram_cache['features_dc'][block_ids_cpu].to(self.device, non_blocking=True)
-                        target_buffer.features_rest[target_slice] = ram_cache['features_rest'][block_ids_cpu].to(self.device, non_blocking=True)
-                    elif 'sh_cache' in ram_cache:
-                        sh_params = ram_cache['sh_cache'][block_ids_cpu]
-                        target_buffer.features_dc[target_slice] = sh_params[:, :3].to(self.device, non_blocking=True)
-                        target_buffer.features_rest[target_slice] = sh_params[:, 3:48].to(self.device, non_blocking=True)
-                    else:
-                        raise KeyError('ram_cache must contain either features_dc/features_rest or sh_cache')
-                    streamed_blocks_used.append(block_id)
-
-                offset += block_len
-
-            all_gaussian_ids = torch.tensor(all_gaussian_ids_list, dtype=torch.long)
-            target_buffer.local_to_global_idx = all_gaussian_ids.to(self.device)
-            target_buffer.loaded_blocks = sorted_visible_blocks
-            target_buffer.num_gaussians = num_visible
-            target_buffer.resident_blocks = resident_blocks_used
-            target_buffer.streamed_blocks = streamed_blocks_used
-            target_buffer.evicted_blocks = sorted(evicted_set)
-
-            target_buffer._block_starts = _build_block_starts(
-                target_buffer.block_to_local_slice, self.num_blocks, self.device,
-            )
-            self._target_layout_ready.set()
-
-            target_buffer.filters_local = []
-            for filter_global in filters_global:
-                if filter_global is not None and len(filter_global) > 0:
-                    filter_local = _global_ids_to_local(
-                        filter_global.to(self.device),
-                        target_buffer._block_starts,
-                        self.block_size,
-                    )
-                    valid_mask = filter_local >= 0
-                    filter_local = filter_local[valid_mask]
-                    target_buffer.filters_local.append(filter_local)
-                else:
-                    target_buffer.filters_local.append(torch.tensor([], dtype=torch.long, device=self.device))
-
-            self.prefetch_complete_event.record(self.prefetch_stream)
-
-            elapsed_ms = (time.time() - start_time) * 1000
-            self.stats['total_prefetch_time_ms'] += elapsed_ms
-
-    def refresh_blocks_from_block_cache(
-        self,
-        block_cache: Dict[int, torch.Tensor],
-        block_ids: List[int],
-        target: str = 'loading',
-    ) -> int:
-        """
-        Refresh selected resident blocks in-place from updated CPU block tensors.
-
-        Paper mode uses the CPU cache as the inter-iteration handoff after
-        writeback, so Omega blocks kept in the next buffer are refreshed after
-        the CPU cache receives updated block tensors.
-        """
-        target_buffer = self.loading_buffer if target == 'loading' else self.active_buffer
-        if target_buffer.is_empty() or not block_ids:
-            return 0
-
-        refreshed = 0
-        with torch.cuda.stream(self.prefetch_stream):
-            for block_id in block_ids:
-                if block_id not in target_buffer.block_to_local_slice:
-                    continue
-                if block_id not in block_cache:
-                    continue
-
-                target_slice = target_buffer.block_to_local_slice[block_id]
-                block_len = target_slice.stop - target_slice.start
-                if block_len <= 0:
-                    continue
-
-                block_tensor = block_cache[block_id]
-                if block_tensor is None or block_tensor.numel() == 0:
-                    continue
-
-                refresh_len = min(block_len, int(block_tensor.shape[0]))
-                if refresh_len <= 0:
-                    continue
-
-                refresh_slice = slice(target_slice.start, target_slice.start + refresh_len)
-                block_gpu = block_tensor[:refresh_len].to(self.device, non_blocking=True)
-                target_buffer.xyz[refresh_slice] = block_gpu[:, 0:3]
-                target_buffer.scaling[refresh_slice] = block_gpu[:, 3:6]
-                target_buffer.rotation[refresh_slice] = block_gpu[:, 6:10]
-                target_buffer.opacity[refresh_slice] = block_gpu[:, 10:11]
-                target_buffer.features_dc[refresh_slice] = block_gpu[:, 11:14]
-                target_buffer.features_rest[refresh_slice] = block_gpu[:, 14:59]
-                refreshed += 1
-
-            if refreshed > 0:
-                self.prefetch_complete_event.record(self.prefetch_stream)
-
-        return refreshed
+    def discard_prefetch(self) -> None:
+        self.synchronize_prefetch()
+        with self.lock:
+            self.prefetch_in_progress = False
+            self.prefetch_iteration = -1
+            self._prefetch_finalized = True
+            self._deferred_resident_blocks = []
+            self._persistent_plan = None
+            self._before_persistent_apply = None
 
     def wait_for_prefetch(self, iteration: int) -> bool:
         """
@@ -1563,126 +1350,7 @@ class DoubleBufferGPUWorkingSet:
             self.prefetch_in_progress = False
         return True
     
-    def load_visible_blocks_sync(
-        self,
-        visible_block_ids: List[int],
-        filters_global: List[torch.Tensor],
-        unified_params: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Synchronous load (fallback when prefetch not available).
-        
-        Loads directly into active buffer.
-        """
-        target_buffer = self.active_buffer
-        target_buffer.clear()
-        
-        if len(visible_block_ids) == 0:
-            raise ValueError("No visible blocks to load!")
-        
-        # Collect all Gaussian IDs
-        all_gaussian_ids = []
-        for block_id in sorted(visible_block_ids):
-            start_idx = block_id * self.block_size
-            end_idx = min(start_idx + self.block_size, self.num_total)
-            all_gaussian_ids.extend(range(start_idx, end_idx))
-        
-        all_gaussian_ids = torch.tensor(all_gaussian_ids, dtype=torch.long)
-        num_visible = len(all_gaussian_ids)
-        
-        # Load from unified_params
-        visible_params = unified_params[all_gaussian_ids]
-        
-        target_buffer.xyz = visible_params[:, 0:3].to(self.device)
-        target_buffer.opacity = visible_params[:, 3:4].to(self.device)
-        target_buffer.scaling = visible_params[:, 4:7].to(self.device)
-        target_buffer.rotation = visible_params[:, 7:11].to(self.device)
-        target_buffer.features_dc = visible_params[:, 11:14].to(self.device)
-        target_buffer.features_rest = visible_params[:, 14:59].to(self.device)
-        
-        # Store mapping
-        target_buffer.local_to_global_idx = all_gaussian_ids.to(self.device)
-        target_buffer.loaded_blocks = sorted(visible_block_ids)
-        target_buffer.num_gaussians = num_visible
-        
-        # Build compact block_starts mapping — O(num_blocks) instead of O(N)
-        block_to_slice: Dict[int, slice] = {}
-        offset = 0
-        for block_id in sorted(visible_block_ids):
-            start_idx = block_id * self.block_size
-            end_idx = min(start_idx + self.block_size, self.num_total)
-            block_len = end_idx - start_idx
-            block_to_slice[block_id] = slice(offset, offset + block_len)
-            offset += block_len
-        target_buffer.block_to_local_slice = block_to_slice
-        target_buffer._block_starts = _build_block_starts(
-            block_to_slice, self.num_blocks, self.device,
-        )
-        
-        # Convert filters
-        target_buffer.filters_local = []
-        for filter_global in filters_global:
-            if filter_global is not None and len(filter_global) > 0:
-                filter_local = _global_ids_to_local(
-                    filter_global.to(self.device),
-                    target_buffer._block_starts,
-                    self.block_size,
-                )
-                valid_mask = filter_local >= 0
-                filter_local = filter_local[valid_mask]
-                target_buffer.filters_local.append(filter_local)
-            else:
-                target_buffer.filters_local.append(torch.tensor([], dtype=torch.long, device=self.device))
-        
-        return {
-            'xyz': target_buffer.xyz,
-            'scaling': target_buffer.scaling,
-            'rotation': target_buffer.rotation,
-            'opacity': target_buffer.opacity,
-            'features_dc': target_buffer.features_dc,
-            'features_rest': target_buffer.features_rest,
-        }
     
-    def update_ram_cache(
-        self,
-        geometry_cache: Optional[Dict[str, torch.Tensor]] = None,
-        sh_cache: Optional[torch.Tensor] = None,
-        unified_params: Optional[torch.Tensor] = None
-    ):
-        """
-        Writeback updated GPU parameters to RAM cache.
-        
-        Args:
-            geometry_cache: Dict with geometry tensors (optional)
-            sh_cache: SH parameter cache (optional)
-            unified_params: Unified params tensor (optional, preferred for SSD offload)
-        """
-        buf = self.active_buffer
-        if buf.is_empty():
-            return
-        
-        global_ids = buf.local_to_global_idx.cpu()
-        
-        if unified_params is not None:
-            # Update unified_params directly
-            # Layout: xyz(3)|opacity(1)|scaling(3)|rotation(4)|dc(3)|rest(45)
-            unified_params[global_ids, 0:3] = buf.xyz.detach().cpu()
-            unified_params[global_ids, 3:4] = buf.opacity.detach().cpu()
-            unified_params[global_ids, 4:7] = buf.scaling.detach().cpu()
-            unified_params[global_ids, 7:11] = buf.rotation.detach().cpu()
-            unified_params[global_ids, 11:14] = buf.features_dc.detach().cpu()
-            unified_params[global_ids, 14:59] = buf.features_rest.detach().cpu()
-        else:
-            # Update separate caches
-            if geometry_cache is not None:
-                geometry_cache['xyz'][global_ids] = buf.xyz.detach().cpu()
-                geometry_cache['scaling'][global_ids] = buf.scaling.detach().cpu()
-                geometry_cache['rotation'][global_ids] = buf.rotation.detach().cpu()
-                geometry_cache['opacity'][global_ids] = buf.opacity.detach().cpu()
-            
-            if sh_cache is not None:
-                sh_data = torch.cat([buf.features_dc, buf.features_rest], dim=1).detach().cpu()
-                sh_cache[global_ids] = sh_data
     
     def get_stats(self) -> Dict[str, any]:
         """Get performance statistics"""
@@ -1710,12 +1378,7 @@ class DoubleBufferGPUWorkingSet:
     
     def clear(self):
         """Clear both buffers"""
-        if self._resident_plan_future is not None:
-            self._resident_plan_future.result()
-        if self._prefetch_future is not None:
-            self._prefetch_future.result()
-        self.prefetch_stream.synchronize()
-        self.resident_refresh_stream.synchronize()
+        self.synchronize_prefetch()
         if not self._executor_shutdown:
             self._prefetch_executor.shutdown(wait=True)
             self._resident_plan_executor.shutdown(wait=True)
@@ -1736,41 +1399,3 @@ class DoubleBufferGPUWorkingSet:
     
     def __del__(self):
         self.clear()
-
-
-# ============================================================================
-# Helper function for N+1 prefetch scheduling
-# ============================================================================
-
-def get_next_iteration_blocks(
-    storage_adapter,
-    training_schedule: List[int],
-    iteration: int,
-    batch_size: int,
-    schedule_ordering: str = "trajectory",
-) -> Tuple[List[int], List[int]]:
-    """
-    Get visible blocks for the next scheduled training iteration.
-
-    Args:
-        storage_adapter: Storage adapter with frustum culling
-        training_schedule: Canonical TSP camera order used by training
-        iteration: Current logical iteration number
-        batch_size: Number of cameras in the current batch
-
-    Returns:
-        (next_camera_ids, next_visible_blocks)
-    """
-    _, next_batch = get_current_and_next_camera_batches(
-        training_schedule=training_schedule,
-        iteration=iteration,
-        batch_size=batch_size,
-        schedule_ordering=schedule_ordering,
-    )
-
-    visible_blocks = set()
-    for cam_id in next_batch.batch_indices:
-        blocks = storage_adapter.get_visible_blocks(cam_id)
-        visible_blocks.update(blocks)
-
-    return next_batch.batch_indices, sorted(list(visible_blocks))

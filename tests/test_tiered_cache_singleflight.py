@@ -59,6 +59,8 @@ class FakeStorage:
             for block_id in range(32)
         }
         self.read_counts = Counter()
+        self.write_calls = []
+        self.versions = {block_id: 0 for block_id in self.data}
         self.call_count = 0
         self.lock = threading.Lock()
         self.block_first_read = False
@@ -74,6 +76,8 @@ class FakeStorage:
             for block_id in block_ids:
                 self.read_counts[block_id] += 1
 
+        snapshots = {block_id: self.data[block_id].clone() for block_id in block_ids}
+
         if self.block_first_read and call_index == 1:
             self.read_started.set()
             if not self.release_read.wait(timeout=2.0):
@@ -82,10 +86,20 @@ class FakeStorage:
         if self.fail_first_read and call_index == 1:
             raise RuntimeError("injected read failure")
 
-        return {block_id: self.data[block_id].clone() for block_id in block_ids}
+        return snapshots
 
-    def write_patch(self, dirty_blocks):
+    def write_patch(self, dirty_blocks, block_versions=None):
+        self.write_calls.append((dict(dirty_blocks), dict(block_versions or {})))
+        for block_id, tensor in dirty_blocks.items():
+            self.data[int(block_id)] = tensor.clone()
+            self.versions[int(block_id)] = int((block_versions or {}).get(block_id, 0))
         return None
+
+    def get_block_versions(self, block_ids):
+        return {
+            int(block_id): self.versions.get(int(block_id), 0)
+            for block_id in block_ids
+        }
 
 
 class TieredCacheSingleFlightTest(unittest.TestCase):
@@ -133,6 +147,39 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
             cache.cache_data[6].untyped_storage().data_ptr(),
         )
         self.assertEqual(cache.dirty_set, {5, 6})
+
+    def test_dirty_flush_passes_logical_versions_to_storage(self):
+        storage = FakeStorage()
+        cache = self.make_cache(storage)
+        tensor = torch.full((storage.block_size, storage.point_dim), 12.0)
+
+        self.assertEqual(cache.upsert_dirty_blocks({4: tensor}, clone=True), 1)
+        self.assertEqual(cache.submit_dirty_blocks([4]), 1)
+        cache.flush_queue.join()
+
+        self.assertEqual(len(storage.write_calls), 1)
+        self.assertEqual(storage.write_calls[0][1], {4: 1})
+
+    def test_old_flush_does_not_clear_newer_dirty_state(self):
+        storage = FakeStorage()
+        cache = self.make_cache(storage)
+        older = torch.full((storage.block_size, storage.point_dim), 1.0)
+        newer = torch.full((storage.block_size, storage.point_dim), 2.0)
+
+        cache.upsert_dirty_blocks({6: older}, clone=True)
+        cache.upsert_dirty_blocks({6: newer}, clone=True)
+        with cache.flushing_lock:
+            cache.flushing_buffer[6] = (older, time.time(), 2)
+
+        cache._flush_dirty_blocks(
+            {6: older},
+            block_versions={6: 1},
+            mode="sync",
+        )
+
+        self.assertEqual(cache.block_versions[6], 2)
+        self.assertIn(6, cache.dirty_set)
+        self.assertIn(6, cache.flushing_buffer)
 
     def test_future_read_serves_urgent_without_second_ssd_read(self):
         storage = FakeStorage()
@@ -218,6 +265,89 @@ class TieredCacheSingleFlightTest(unittest.TestCase):
         finally:
             with cache.flushing_lock:
                 cache.flushing_buffer.pop(9, None)
+
+    def test_slow_ssd_read_cannot_overwrite_newer_dirty_cache(self):
+        storage = FakeStorage()
+        storage.block_first_read = True
+        cache = self.make_cache(storage)
+        result = {}
+        errors = []
+
+        def read_block():
+            try:
+                result.update(cache.prefetch([7]))
+            except Exception as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_block)
+        reader.start()
+        self.assertTrue(storage.read_started.wait(timeout=2.0))
+
+        newer = torch.full((storage.block_size, storage.point_dim), 99.0)
+        cache.upsert_dirty_blocks({7: newer}, clone=True)
+        storage.release_read.set()
+        reader.join(timeout=2.0)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(torch.equal(cache.cache_data[7], newer))
+        self.assertTrue(torch.equal(result[7], newer))
+
+    def test_slow_ssd_read_retries_after_newer_writeback_completes(self):
+        storage = FakeStorage()
+        storage.block_first_read = True
+        cache = self.make_cache(storage)
+        result = {}
+        errors = []
+
+        def read_block():
+            try:
+                result.update(cache.prefetch([7]))
+            except Exception as exc:
+                errors.append(exc)
+
+        reader = threading.Thread(target=read_block)
+        reader.start()
+        self.assertTrue(storage.read_started.wait(timeout=2.0))
+
+        newer = torch.full((storage.block_size, storage.point_dim), 99.0)
+        cache.upsert_dirty_blocks({7: newer}, clone=True)
+        with cache.cache_lock:
+            staged = cache.cache_data.pop(7)
+        with cache.flushing_lock:
+            cache.flushing_buffer[7] = (staged, time.time(), 1)
+        cache._flush_dirty_blocks({7: staged}, block_versions={7: 1}, mode="sync")
+
+        storage.release_read.set()
+        reader.join(timeout=2.0)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(torch.equal(result[7], newer))
+        self.assertTrue(torch.equal(cache.cache_data[7], newer))
+        self.assertGreaterEqual(cache.get_stats()["stale_read_retries"], 1)
+
+    def test_future_prefetch_retries_after_newer_writeback_completes(self):
+        storage = FakeStorage()
+        storage.block_first_read = True
+        cache = self.make_cache(storage)
+
+        self.assertEqual(cache.prefetch_future([8]), 1)
+        self.assertTrue(storage.read_started.wait(timeout=2.0))
+
+        newer = torch.full((storage.block_size, storage.point_dim), 77.0)
+        cache.upsert_dirty_blocks({8: newer}, clone=True)
+        with cache.cache_lock:
+            staged = cache.cache_data.pop(8)
+        with cache.flushing_lock:
+            cache.flushing_buffer[8] = (staged, time.time(), 1)
+        cache._flush_dirty_blocks({8: staged}, block_versions={8: 1}, mode="sync")
+
+        storage.release_read.set()
+        cache.future_prefetch_queue.join()
+
+        self.assertTrue(torch.equal(cache.cache_data[8], newer))
+        self.assertGreaterEqual(cache.get_stats()["stale_read_retries"], 1)
 
     def test_future_failure_wakes_urgent_and_allows_fallback_read(self):
         storage = FakeStorage()

@@ -11,6 +11,7 @@ import json
 import math
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -23,16 +24,27 @@ from utils.sh_utils import C0
 RECORD_DTYPE = np.dtype([("morton", "<u8"), ("params", "<f4", (59,))])
 MORTON_BITS = 30
 
+# Scale initialization modes.
+#   knn3: per-point log(sqrt(mean squared distance to the 3 nearest neighbours)),
+#         the 3DGS / CLM `distCUDA2` rule, evaluated one Morton bucket at a time so
+#         it stays out-of-core.  GPU `distCUDA2` when CUDA is available, otherwise
+#         a scipy KD-tree with the identical formula.
+#   morton_bucket_density_clamped: legacy bucket-volume density estimate (one
+#         value per bucket).  Overestimates scale on surface point clouds.
+SCALE_MODE_KNN3 = "knn3"
+SCALE_MODE_LEGACY = "morton_bucket_density_clamped"
+SCALE_MODES = (SCALE_MODE_KNN3, SCALE_MODE_LEGACY)
+KNN_K = 3
+KNN_MIN_DIST2 = 1e-7  # same floor as create_from_pcd / distCUDA2 callers
+_KNN_BACKEND: Optional[str] = None
+
 
 def _stream_log(message: str) -> None:
-    print(message)
     try:
         log_file = utils.get_log_file()
     except Exception:
         log_file = None
-    if log_file is not None:
-        log_file.write(message + "\n")
-        log_file.flush()
+    utils.log_and_print(message, log_file)
 
 
 def _bytes_to_gib(num_bytes: int) -> float:
@@ -192,6 +204,80 @@ def _estimate_bucket_log_scale(
     return float(np.clip(local_log_scale, global_log_scale - clamp_delta, global_log_scale + clamp_delta))
 
 
+def _resolve_knn_backend() -> str:
+    """Pick distCUDA2 on a CUDA device, else scipy.  Resolved once per process."""
+    global _KNN_BACKEND
+    if _KNN_BACKEND is not None:
+        return _KNN_BACKEND
+    backend = "scipy"
+    try:
+        import torch  # torch must be imported before simple_knn._C (libc10)
+
+        if torch.cuda.is_available():
+            from simple_knn._C import distCUDA2  # noqa: F401
+
+            backend = "distCUDA2"
+    except Exception:
+        backend = "scipy"
+    if backend == "scipy":
+        from scipy.spatial import cKDTree  # noqa: F401  raises ImportError if unavailable
+    _KNN_BACKEND = backend
+    _stream_log(f"[STREAMING PLY INIT] knn3 scale backend: {backend}")
+    return backend
+
+
+def _knn3_log_scale(xyz: np.ndarray) -> np.ndarray:
+    """Per-point log-scale from the 3 nearest neighbours inside ``xyz``.
+
+    Identical to ``log(sqrt(clamp_min(distCUDA2(points), 1e-7)))`` used by
+    ``create_from_pcd``; here ``xyz`` is one Morton bucket (or one streamed chunk
+    of an equal-key bucket), so peak memory stays bounded by the sort budget.
+    """
+    xyz = np.ascontiguousarray(xyz, dtype=np.float32)
+    n = int(xyz.shape[0])
+    k = min(KNN_K, n - 1)
+    if k <= 0:
+        return np.full((n,), 0.5 * math.log(KNN_MIN_DIST2), dtype=np.float32)
+
+    backend = _resolve_knn_backend()
+    if backend == "distCUDA2" and k == KNN_K:
+        import torch
+        from simple_knn._C import distCUDA2
+
+        with torch.no_grad():
+            points = torch.from_numpy(xyz).cuda()
+            dist2 = torch.clamp_min(distCUDA2(points), KNN_MIN_DIST2)
+            out = torch.log(torch.sqrt(dist2)).cpu().numpy().astype(np.float32)
+            del points, dist2
+        return out
+
+    from scipy.spatial import cKDTree
+
+    distances, _ = cKDTree(xyz).query(xyz, k=k + 1, workers=-1)
+    dist2 = np.maximum((distances[:, 1:] ** 2).mean(axis=1), KNN_MIN_DIST2)
+    return (0.5 * np.log(dist2)).astype(np.float32)
+
+
+def _assign_scales(
+    params: np.ndarray,
+    scale_mode: str,
+    n_points_hint: int,
+    global_log_scale: float,
+    scale_clamp_delta: float,
+) -> None:
+    """Fill columns 3:6 of ``params`` in place according to ``scale_mode``."""
+    if scale_mode == SCALE_MODE_KNN3:
+        params[:, 3:6] = _knn3_log_scale(params[:, 0:3])[:, None]
+        return
+    bucket_log_scale = _estimate_bucket_log_scale(
+        params[:, 0:3],
+        int(n_points_hint),
+        global_log_scale=global_log_scale,
+        clamp_delta=scale_clamp_delta,
+    )
+    params[:, 3:6] = np.float32(bucket_log_scale)
+
+
 def _get_first_existing_name(names: set[str], candidates: Tuple[str, ...]) -> Optional[str]:
     for candidate in candidates:
         if candidate in names:
@@ -330,6 +416,7 @@ def _sort_bucket_to_base(
     max_sort_memory_mb: float,
     sort_stats: dict,
     delete_temp: bool = True,
+    scale_mode: str = SCALE_MODE_KNN3,
 ) -> int:
     bucket_bytes = bucket_path.stat().st_size
     sort_stats["max_bucket_bytes"] = max(int(sort_stats.get("max_bucket_bytes", 0)), int(bucket_bytes))
@@ -349,6 +436,7 @@ def _sort_bucket_to_base(
             max_sort_memory_mb=max_sort_memory_mb,
             sort_stats=sort_stats,
             delete_temp=delete_temp,
+            scale_mode=scale_mode,
         )
         return split_row
 
@@ -358,13 +446,13 @@ def _sort_bucket_to_base(
     sort_stats["in_memory_buckets"] = int(sort_stats.get("in_memory_buckets", 0)) + 1
     order = np.argsort(records["morton"], kind="stable")
     params = np.ascontiguousarray(records["params"][order])
-    bucket_log_scale = _estimate_bucket_log_scale(
-        params[:, 0:3],
-        int(params.shape[0]),
+    _assign_scales(
+        params,
+        scale_mode=scale_mode,
+        n_points_hint=int(params.shape[0]),
         global_log_scale=global_log_scale,
-        clamp_delta=scale_clamp_delta,
+        scale_clamp_delta=scale_clamp_delta,
     )
-    params[:, 3:6] = np.float32(bucket_log_scale)
     base_handle.write(params.tobytes())
     _update_block_bounds(block_bounds, start_row, params[:, 0:3], block_size)
     if delete_temp:
@@ -433,6 +521,7 @@ def _stream_equal_key_bucket_to_base(
     global_log_scale: float,
     scale_clamp_delta: float,
     delete_temp: bool,
+    scale_mode: str = SCALE_MODE_KNN3,
 ) -> int:
     count, xyz_min, xyz_max = _scan_bucket_xyz_stats(bucket_path)
     if count == 0:
@@ -441,12 +530,14 @@ def _stream_equal_key_bucket_to_base(
         f"[STREAMING PLY INIT] pass3 stream equal-key {bucket_path.name}: "
         f"rows={count:,} start_row={start_row:,}"
     )
-    bucket_log_scale = _estimate_bucket_log_scale(
-        np.stack([xyz_min, xyz_max], axis=0),
-        count,
-        global_log_scale=global_log_scale,
-        clamp_delta=scale_clamp_delta,
-    )
+    bucket_log_scale = None
+    if scale_mode != SCALE_MODE_KNN3:
+        bucket_log_scale = _estimate_bucket_log_scale(
+            np.stack([xyz_min, xyz_max], axis=0),
+            count,
+            global_log_scale=global_log_scale,
+            clamp_delta=scale_clamp_delta,
+        )
 
     row_cursor = start_row
     records_per_chunk = max(1, int((64 * 1024 * 1024) // RECORD_DTYPE.itemsize))
@@ -456,7 +547,11 @@ def _stream_equal_key_bucket_to_base(
             if records.size == 0:
                 break
             params = np.ascontiguousarray(records["params"])
-            params[:, 3:6] = np.float32(bucket_log_scale)
+            if scale_mode == SCALE_MODE_KNN3:
+                # Equal-key buckets share one Morton cell; kNN per 64 MiB chunk.
+                params[:, 3:6] = _knn3_log_scale(params[:, 0:3])[:, None]
+            else:
+                params[:, 3:6] = np.float32(bucket_log_scale)
             base_handle.write(params.tobytes())
             _update_block_bounds(block_bounds, row_cursor, params[:, 0:3], block_size)
             row_cursor += int(params.shape[0])
@@ -480,6 +575,7 @@ def _sort_large_bucket_to_base(
     max_sort_memory_mb: float,
     sort_stats: dict,
     delete_temp: bool,
+    scale_mode: str = SCALE_MODE_KNN3,
 ) -> int:
     max_level = _max_morton_level(bucket_bits)
     if level >= max_level:
@@ -493,6 +589,7 @@ def _sort_large_bucket_to_base(
             global_log_scale=global_log_scale,
             scale_clamp_delta=scale_clamp_delta,
             delete_temp=delete_temp,
+            scale_mode=scale_mode,
         )
 
     child_level = level + 1
@@ -532,6 +629,7 @@ def _sort_large_bucket_to_base(
             max_sort_memory_mb=max_sort_memory_mb,
             sort_stats=sort_stats,
             delete_temp=delete_temp,
+            scale_mode=scale_mode,
         )
     if delete_temp:
         shutil.rmtree(split_dir, ignore_errors=True)
@@ -548,9 +646,19 @@ def streaming_ply_to_ssd_base(
     scale_clamp_delta: float = 2.0,
     max_sort_memory_mb: float = 512.0,
     keep_temp: bool = False,
+    scale_mode: str = SCALE_MODE_KNN3,
 ) -> dict:
-    """Stream a binary PLY into a Morton-sorted SSD base file and metadata."""
-    if not debug_fast_init_scales:
+    """Stream a binary PLY into a Morton-sorted SSD base file and metadata.
+
+    ``scale_mode="knn3"`` (default) initializes every Gaussian from its 3 nearest
+    neighbours inside its Morton bucket (distCUDA2 on GPU, scipy otherwise).
+    ``scale_mode="morton_bucket_density_clamped"`` keeps the legacy per-bucket
+    density estimate and still requires ``debug_fast_init_scales``.
+    """
+    scale_mode = str(scale_mode).lower()
+    if scale_mode not in SCALE_MODES:
+        raise ValueError(f"Unsupported scale_mode={scale_mode!r}; expected one of {SCALE_MODES}")
+    if scale_mode == SCALE_MODE_LEGACY and not debug_fast_init_scales:
         raise RuntimeError(
             "streaming PLY init requires --debug_fast_init_scales; full distCUDA2 is not out-of-core"
         )
@@ -589,6 +697,9 @@ def streaming_ply_to_ssd_base(
     )
 
     log_scale = _estimate_log_scale(scene_min, scene_max, header.vertex_count)
+    _stream_log(f"[STREAMING PLY INIT] scale_mode={scale_mode}")
+    if scale_mode == SCALE_MODE_KNN3:
+        _resolve_knn_backend()
     bucket_paths = _write_records_by_bucket(
         header=header,
         temp_dir=temp_dir,
@@ -636,6 +747,7 @@ def streaming_ply_to_ssd_base(
                 max_sort_memory_mb=float(max_sort_memory_mb),
                 sort_stats=sort_stats,
                 delete_temp=not keep_temp,
+                scale_mode=scale_mode,
             )
             _stream_log(
                 f"[STREAMING PLY INIT] pass3 sorted {i + 1}/{total_buckets} buckets, "
@@ -670,9 +782,19 @@ def streaming_ply_to_ssd_base(
         "layout": "cache: xyz|scaling|rotation|opacity|features_dc|features_rest",
         "scene_min": scene_min.astype(float).tolist(),
         "scene_max": scene_max.astype(float).tolist(),
-        "scale_mode": "morton_bucket_density_clamped",
+        "scale_mode": scale_mode,
         "global_log_scale": float(log_scale),
         "scale_clamp_delta": float(scale_clamp_delta),
+        "knn": (
+            {
+                "k": KNN_K,
+                "min_dist2": KNN_MIN_DIST2,
+                "backend": _KNN_BACKEND,
+                "neighborhood": "morton bucket (in-memory sort unit); 64 MiB chunk for equal-key buckets",
+            }
+            if scale_mode == SCALE_MODE_KNN3
+            else None
+        ),
         "external_sort": sort_stats,
         "morton": {
             "type": "standard_10bit",
@@ -694,3 +816,45 @@ def streaming_ply_to_ssd_base(
         f"size={actual_size / (1024 ** 3):.2f}GB blocks={num_blocks:,}"
     )
     return manifest
+
+
+def _main(argv=None) -> int:
+    """Standalone base builder: python -m storage.streaming_ply_init --ply ... --output ..."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Stream a binary PLY into a Morton-sorted TideGS SSD base (base_file.bin, "
+        "block_bounds.npy, streaming_init_manifest.json) without starting training."
+    )
+    parser.add_argument("--ply", required=True, help="binary_little_endian PLY with x,y,z (+rgb)")
+    parser.add_argument("--output", required=True, help="output directory for the base")
+    parser.add_argument("--block-size", type=int, default=4096)
+    parser.add_argument("--scale-mode", choices=SCALE_MODES, default=SCALE_MODE_KNN3)
+    parser.add_argument("--bucket-bits", type=int, default=10)
+    parser.add_argument("--sort-memory-mb", type=float, default=512.0,
+                        help="max in-RAM bucket size; also bounds the per-call kNN working set")
+    parser.add_argument("--chunk-vertices", type=int, default=1_000_000)
+    parser.add_argument("--keep-temp", action="store_true")
+    args = parser.parse_args(argv)
+
+    manifest = streaming_ply_to_ssd_base(
+        ply_path=args.ply,
+        output_dir=args.output,
+        block_size=args.block_size,
+        debug_fast_init_scales=(args.scale_mode == SCALE_MODE_LEGACY),
+        chunk_vertices=args.chunk_vertices,
+        bucket_bits=args.bucket_bits,
+        max_sort_memory_mb=args.sort_memory_mb,
+        keep_temp=args.keep_temp,
+        scale_mode=args.scale_mode,
+    )
+    summary = {
+        key: manifest.get(key)
+        for key in ("manifest_path", "base_file", "block_bounds", "total_points", "num_blocks", "scale_mode", "knn")
+    }
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

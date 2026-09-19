@@ -39,14 +39,16 @@ CHECKPOINT_MODE="incremental"
 CHECKPOINT_PATCH_MODE="hardlink"
 CHECKPOINT_KEEP_LAST=2
 MAX_PATCH_FILES=16
-MAX_PATCH_GB=64
+MAX_STALE_PATCH_GB=64
+MAX_PATCH_TOTAL_GB=128
 MIN_FREE_GB=64
 RESIDENT_POLICY="topc_balanced_active_first"
 RESIDENT_LAMBDA_LIST="0.3"
 RESIDENT_DECAY_LIST="0.95"
 BALANCED_SEED_FRACTION_LIST="0.25"
 BSZ_LIST="16"
-CAPACITY_LIST="2048"
+CAPACITY_LIST="2048"  # smoke/debug value; full-camera runs must pass --capacity explicitly
+CAPACITY_USER_SET=0
 CHECKPOINT_ITER=500
 RESUME_TO_ITER=1000
 START_CHECKPOINT=""
@@ -77,16 +79,18 @@ Options:
   --debug-camera-sample-mode M linspace|contiguous|window (default: ${DEBUG_CAMERA_SAMPLE_MODE})
   --debug-camera-sample-start N Start index for window mode (default: ${DEBUG_CAMERA_SAMPLE_START})
   --bsz N                     Single batch size for release runs
-  --capacity N                Single resident block capacity for release runs
+  --capacity N                Resident block capacity (default ${CAPACITY_LIST} is a smoke/debug value;
+                              full-camera runs must set it explicitly, sized to GPU memory)
   --bsz-list "LIST"           Batch sizes for sweeps (default: "${BSZ_LIST}")
-  --capacity-list "LIST"      Resident block capacities for sweeps (default: "${CAPACITY_LIST}")
+  --capacity-list "LIST"      Resident block capacities for sweeps (default: "${CAPACITY_LIST}", smoke/debug only)
   --projection-chunk N        projection_max_cameras_per_chunk (default: ${PROJECTION_CHUNK})
   --max-ram-gb N              RAM cache budget (default: ${MAX_RAM_GB})
   --checkpoint-mode MODE      incremental|snapshot (default: ${CHECKPOINT_MODE})
   --checkpoint-patch-mode M   hardlink|copy (default: ${CHECKPOINT_PATCH_MODE})
   --checkpoint-keep-last N    Retain the newest N checkpoints; -1 keeps all (default: ${CHECKPOINT_KEEP_LAST})
   --max-patch-files N         Compact at this active patch count (default: ${MAX_PATCH_FILES})
-  --max-patch-gb N            Compact at this stale patch size in GiB (default: ${MAX_PATCH_GB})
+  --max-stale-patch-gb N      Compact at this stale patch size in GiB (default: ${MAX_STALE_PATCH_GB})
+  --max-patch-total-gb N      Compact at this total patch size in GiB (default: ${MAX_PATCH_TOTAL_GB})
   --min-free-gb N             Refuse writes that consume this free-space reserve (default: ${MIN_FREE_GB})
   --resident-policy POLICY    TopC policy (default: ${RESIDENT_POLICY})
   --resident-lambda VALUE     Single resident-set mixing weight
@@ -137,15 +141,16 @@ while [[ $# -gt 0 ]]; do
     --debug-camera-sample-start) DEBUG_CAMERA_SAMPLE_START="$2"; shift 2 ;;
     --bsz) BSZ_LIST="$2"; shift 2 ;;
     --bsz-list) BSZ_LIST="$2"; shift 2 ;;
-    --capacity) CAPACITY_LIST="$2"; shift 2 ;;
-    --capacity-list) CAPACITY_LIST="$2"; shift 2 ;;
+    --capacity) CAPACITY_LIST="$2"; CAPACITY_USER_SET=1; shift 2 ;;
+    --capacity-list) CAPACITY_LIST="$2"; CAPACITY_USER_SET=1; shift 2 ;;
     --projection-chunk) PROJECTION_CHUNK="$2"; shift 2 ;;
     --max-ram-gb) MAX_RAM_GB="$2"; shift 2 ;;
     --checkpoint-mode) CHECKPOINT_MODE="$2"; shift 2 ;;
     --checkpoint-patch-mode) CHECKPOINT_PATCH_MODE="$2"; shift 2 ;;
     --checkpoint-keep-last) CHECKPOINT_KEEP_LAST="$2"; shift 2 ;;
     --max-patch-files) MAX_PATCH_FILES="$2"; shift 2 ;;
-    --max-patch-gb) MAX_PATCH_GB="$2"; shift 2 ;;
+    --max-stale-patch-gb) MAX_STALE_PATCH_GB="$2"; shift 2 ;;
+    --max-patch-total-gb) MAX_PATCH_TOTAL_GB="$2"; shift 2 ;;
     --min-free-gb) MIN_FREE_GB="$2"; shift 2 ;;
     --resident-policy) RESIDENT_POLICY="$2"; shift 2 ;;
     --resident-lambda) RESIDENT_LAMBDA_LIST="$2"; shift 2 ;;
@@ -170,6 +175,10 @@ case "${MODE}" in
   *) echo "Invalid --mode '${MODE}'" >&2; usage >&2; exit 1 ;;
 esac
 
+if [[ "${MODE}" != "summary" && "${DEBUG_MAX_TRAIN_CAMERAS}" == "-1" && "${CAPACITY_USER_SET}" != "1" ]]; then
+  echo "Full-camera run (--debug-max-train-cameras -1) requires an explicit --capacity: the default ${CAPACITY_LIST} is a smoke/debug value. Size it to GPU memory, scene density, and runtime headroom." >&2
+  exit 1
+fi
 if [[ "${MODE}" != "summary" ]]; then
   if [[ -z "${SRC}" ]]; then
     echo "Missing dataset path. Set SRC, MATRIXCITY_SCENE_DIR, or pass --src." >&2
@@ -298,7 +307,8 @@ append_train_command() {
     printf '  --pure_ssd_checkpoint_patch_mode %q \\\n' "${CHECKPOINT_PATCH_MODE}"
     printf '  --pure_ssd_checkpoint_keep_last %q \\\n' "${CHECKPOINT_KEEP_LAST}"
     printf '  --tide_storage_max_patch_files %q \\\n' "${MAX_PATCH_FILES}"
-    printf '  --tide_storage_max_patch_gb %q \\\n' "${MAX_PATCH_GB}"
+    printf '  --tide_storage_max_stale_patch_gb %q \\\n' "${MAX_STALE_PATCH_GB}"
+    printf '  --tide_storage_max_patch_total_gb %q \\\n' "${MAX_PATCH_TOTAL_GB}"
     printf '  --tide_storage_min_free_gb %q \\\n' "${MIN_FREE_GB}"
     if [[ "${DEBUG_LOGGING}" == "1" ]]; then
       printf '  --tide_debug_logging \\\n'

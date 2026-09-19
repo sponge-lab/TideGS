@@ -17,7 +17,6 @@ import numpy as np
 import random
 import os
 import time
-from argparse import Namespace
 import psutil
 
 ARGS = None
@@ -117,6 +116,14 @@ def inc_densify_iter():
 
 def print_rank_0(str):
     print(str)
+
+
+def log_and_print(message, log_file=None):
+    message = str(message).rstrip("\n")
+    print_rank_0(message)
+    if log_file is not None:
+        log_file.write(message + "\n")
+        log_file.flush()
 
 
 def check_enable_python_timer():
@@ -388,17 +395,12 @@ def safe_state(silent, log_file=None):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda", 0))
 
 
-def prepare_output_and_logger(args):
+def prepare_output_dir(args):
     # Set up output folder
     print_rank_0("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok=True)
-    with open(
-        os.path.join(args.model_path, "cfg_args"), "w"
-    ) as cfg_log_f:  # TODO: I want to delete cfg_args file.
-        cfg_log_f.write(str(Namespace(**vars(args))))
 
 
 def log_cpu_memory_usage(position_str):

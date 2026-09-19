@@ -15,7 +15,7 @@ import shutil
 from numba.cuda.cudadrv.runtime import Runtime
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch, get_args, get_log_file
+from utils.general_utils import PILtoTorch, get_log_file
 import utils.general_utils as utils
 from tqdm import tqdm
 from utils.graphics_utils import fov2focal
@@ -39,7 +39,6 @@ def loadCam(
     #     orig_w == utils.get_img_width() and orig_h == utils.get_img_height()
     # ), f"All images should have the same size. Found {orig_w}, {utils.get_img_width()}, {orig_h}, and {utils.get_img_height()}."
 
-    args = get_args()
     log_file = get_log_file()
     # resolution = orig_w, orig_h
     resolution = utils.get_img_width(), utils.get_img_height()
@@ -76,6 +75,7 @@ def loadCam(
         gt_alpha_mask=loaded_mask,
         image_name=cam_info.image_name,
         uid=id,
+        args=args,
         offload=offload,
     )
 
@@ -142,6 +142,7 @@ def loadCam_raw_from_disk(args, id, cam_info, to_gpu=False):
         gt_alpha_mask=None,
         image_name=cam_info.image_name,
         uid=id,
+        args=args,
         offload=True,
     )
 
@@ -153,7 +154,6 @@ def load_decompressed_image(params):
 
 # Modify this code to support shared_memory.SharedMemory to make inter-process communication faster
 def decompressed_images_from_camInfos_multiprocess(cam_infos, args):
-    args = get_args()
     decompressed_images = []
     total_cameras = len(cam_infos)
 
@@ -219,7 +219,6 @@ def load_decompressed_image_shared(params):
 def decompressed_images_from_camInfos_multiprocess_sharedmem(
     cam_infos, resolution_scale, args
 ):
-    args = get_args()
     decompressed_images = []
     total_cameras = len(cam_infos)
 
@@ -298,7 +297,6 @@ def predecode_dataset_to_disk_multiprocess(cam_infos, args, num_workers=None):
         args: Arguments object
         num_workers: Number of worker processes. If None, uses min(cpu_count, 16)
     """
-    args = get_args()
     orig_h, orig_w = utils.get_img_size()
 
     # Create tasks for multiprocessing
@@ -323,7 +321,6 @@ def predecode_dataset_to_disk_multiprocess(cam_infos, args, num_workers=None):
 
 def predecode_dataset_to_disk(cam_infos, args):
     """Original single-threaded version"""
-    args = get_args()
     if args.multiprocesses_decode_dataset_to_disk:
         # Use multiprocessing to decode dataset to disk
         predecode_dataset_to_disk_multiprocess(cam_infos, args)
@@ -343,13 +340,10 @@ def predecode_dataset_to_disk(cam_infos, args):
 
 
 def clean_up_disk(args):
-    args = get_args()
     shutil.rmtree(os.path.join(args.decode_dataset_path, "dataset_raw"))
 
 
 def cameraList_from_camInfos(cam_infos, args):
-    args = get_args()
-
     if args.multiprocesses_image_loading:
         decompressed_images = decompressed_images_from_camInfos_multiprocess(
             cam_infos, args

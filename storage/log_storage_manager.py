@@ -52,7 +52,8 @@ class LogStorageManager:
         dtype: torch.dtype = torch.float32,
         verbose: bool = True,
         max_patch_files: int = 16,
-        max_patch_gb: float = 64.0,
+        max_stale_patch_gb: float = 64.0,
+        max_patch_total_gb: float = 128.0,
         min_free_gb: float = 64.0,
     ):
         """
@@ -66,7 +67,8 @@ class LogStorageManager:
             dtype: Data type for storage
             verbose: Print routine storage lifecycle messages
             max_patch_files: Compact when the active patch count reaches this value
-            max_patch_gb: Compact when reclaimable stale patch data reaches this size
+            max_stale_patch_gb: Compact when reclaimable stale patch data reaches this size
+            max_patch_total_gb: Compact when active patch data reaches this size
             min_free_gb: Free-space reserve enforced before writes and compaction
         """
         self.storage_dir = Path(storage_dir)
@@ -80,7 +82,8 @@ class LogStorageManager:
         self.bytes_per_point = point_dim * torch.finfo(dtype).bits // 8
         self.bytes_per_block = block_size * self.bytes_per_point
         self.max_patch_files = max(2, int(max_patch_files))
-        self.max_stale_patch_bytes = max(0, int(float(max_patch_gb) * (1024 ** 3)))
+        self.max_stale_patch_bytes = max(0, int(float(max_stale_patch_gb) * (1024 ** 3)))
+        self.max_patch_total_bytes = max(0, int(float(max_patch_total_gb) * (1024 ** 3)))
         self.min_free_bytes = max(0, int(float(min_free_gb) * (1024 ** 3)))
 
         # Metadata index: block_id -> BlockLocation
@@ -109,7 +112,11 @@ class LogStorageManager:
             'reads': 0,
             'writes': 0,
             'patches_created': 0,
+            'patch_write_jobs': 0,
+            'patch_write_bytes': 0,
+            'patch_write_time': 0.0,
             'compactions': 0,
+            'compaction_time': 0.0,
             'compaction_input_bytes': 0,
             'compaction_output_bytes': 0,
             'compaction_reclaimed_bytes': 0,
@@ -290,7 +297,11 @@ class LogStorageManager:
             raise RuntimeError(f"Base segment returned empty data for block {block_id}")
         return torch.from_numpy(np_array).reshape(curr_num_points, self.point_dim)
 
-    def write_patch(self, block_dict: Dict[int, torch.Tensor]) -> int:
+    def write_patch(
+        self,
+        block_dict: Dict[int, torch.Tensor],
+        block_versions: Optional[Dict[int, int]] = None,
+    ) -> int:
         if not block_dict:
             return -1
         estimated_bytes = sum(
@@ -303,12 +314,19 @@ class LogStorageManager:
                 self.maybe_compact(min_patches=2)
             self._check_free_space(estimated_bytes, "patch write")
             with self._storage_operation():
-                patch_id = self._write_patch_uncoordinated(block_dict)
+                patch_id = self._write_patch_uncoordinated(
+                    block_dict,
+                    block_versions=block_versions,
+                )
             if self._compaction_needed():
                 self.maybe_compact(min_patches=2)
             return patch_id
 
-    def _write_patch_uncoordinated(self, block_dict: Dict[int, torch.Tensor]) -> int:
+    def _write_patch_uncoordinated(
+        self,
+        block_dict: Dict[int, torch.Tensor],
+        block_versions: Optional[Dict[int, int]] = None,
+    ) -> int:
         """
         Write updated blocks to a new patch file (append-only).
 
@@ -342,6 +360,24 @@ class LogStorageManager:
             print("[LogStorage] Skipped patch creation: no non-empty dirty blocks")
             return -1
 
+        incoming_versions = {
+            int(block_id): int(version)
+            for block_id, version in (block_versions or {}).items()
+        }
+        with self.index_lock:
+            accepted_blocks = {}
+            for block_id, tensor in valid_blocks.items():
+                current_version = (
+                    self.index[block_id].version if block_id in self.index else 0
+                )
+                incoming_version = incoming_versions.get(block_id)
+                if incoming_version is None or incoming_version > current_version:
+                    accepted_blocks[block_id] = tensor
+        valid_blocks = accepted_blocks
+
+        if not valid_blocks:
+            return -1
+
         # Allocate new patch file ID
         with self.patch_counter_lock:
             patch_id = self.next_patch_id
@@ -354,6 +390,7 @@ class LogStorageManager:
         current_offset = 0
         updated_locations = {}
 
+        write_started = time.perf_counter()
         try:
             with open(patch_file, 'wb') as f:
                 for block_id in sorted(valid_blocks.keys()):  # Sort for determinism
@@ -367,11 +404,16 @@ class LogStorageManager:
 
                     with self.index_lock:
                         old_version = self.index[block_id].version if block_id in self.index else 0
+                    incoming_version = incoming_versions.get(block_id)
                     updated_locations[block_id] = BlockLocation(
                         file_id=patch_id,
                         offset=current_offset,
                         size=len(data_bytes),
-                        version=old_version + 1,
+                        version=(
+                            incoming_version
+                            if incoming_version is not None
+                            else old_version + 1
+                        ),
                     )
                     current_offset += len(data_bytes)
                 f.flush()
@@ -379,6 +421,8 @@ class LogStorageManager:
         except Exception:
             patch_file.unlink(missing_ok=True)
             raise
+        finally:
+            self.stats['patch_write_time'] += time.perf_counter() - write_started
 
         # Update index atomically
         # 只有文件全部写完落盘后，才会更新内存索引，确保不会读到写了一半的文件
@@ -389,10 +433,20 @@ class LogStorageManager:
 
         self.stats['writes'] += len(valid_blocks)
         self.stats['patches_created'] += 1
+        self.stats['patch_write_jobs'] += 1
+        self.stats['patch_write_bytes'] += current_offset
 
         print(f"[LogStorage] Created patch {patch_id} with {len(valid_blocks)} blocks ({current_offset / 1024 / 1024:.2f} MB)")
 
         return patch_id
+
+    def get_block_versions(self, block_ids: List[int]) -> Dict[int, int]:
+        with self.index_lock:
+            return {
+                int(block_id): int(self.index[int(block_id)].version)
+                for block_id in block_ids
+                if int(block_id) in self.index
+            }
 
     def export_index_manifest(
         self,
@@ -623,6 +677,9 @@ class LogStorageManager:
         _, _, patch_paths, patch_bytes, _, live_bytes = self._patch_state()
         stale_bytes = max(0, patch_bytes - live_bytes)
         return len(patch_paths) >= self.max_patch_files or (
+            self.max_patch_total_bytes > 0
+            and patch_bytes >= self.max_patch_total_bytes
+        ) or (
             self.max_stale_patch_bytes > 0
             and stale_bytes >= self.max_stale_patch_bytes
         )
@@ -659,7 +716,7 @@ class LogStorageManager:
                 if not force and not self._compaction_needed():
                     return False
 
-                start_time = time.time()
+                start_time = time.perf_counter()
                 self._check_free_space(live_bytes, "patch compaction")
                 with self.patch_counter_lock:
                     compacted_file_id = self.next_patch_id
@@ -718,7 +775,9 @@ class LogStorageManager:
                     except FileNotFoundError:
                         pass
 
+                compaction_elapsed = time.perf_counter() - start_time
                 self.stats["compactions"] += 1
+                self.stats["compaction_time"] += compaction_elapsed
                 self.stats["compaction_input_bytes"] += int(patch_bytes)
                 self.stats["compaction_output_bytes"] += int(output_bytes)
                 self.stats["compaction_reclaimed_bytes"] += max(
@@ -727,7 +786,7 @@ class LogStorageManager:
                 print(
                     f"[LogStorage] Compacted {len(patch_paths)} patches into "
                     f"{len(live_block_ids)} live blocks ({output_bytes / (1024 ** 3):.2f} GiB) "
-                    f"in {time.time() - start_time:.2f}s"
+                    f"in {compaction_elapsed:.2f}s"
                 )
                 return True
 
@@ -761,6 +820,16 @@ class LogStorageManager:
             'live_patch_size_mb': live_bytes / 1024 / 1024,
             'stale_patch_size_mb': max(0, patch_bytes - live_bytes) / 1024 / 1024,
             'free_space_gb': free_bytes / (1024 ** 3),
+        }
+
+    def get_timing_stats(self) -> Dict:
+        """Return write and compaction counters without scanning storage files."""
+        return {
+            'patch_write_jobs': self.stats['patch_write_jobs'],
+            'patch_write_bytes': self.stats['patch_write_bytes'],
+            'patch_write_time': self.stats['patch_write_time'],
+            'compaction_jobs': self.stats['compactions'],
+            'compaction_time': self.stats['compaction_time'],
         }
 
     def close(self):

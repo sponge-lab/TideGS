@@ -15,7 +15,6 @@ from .async_pipeline import AsyncPipeline, TSPScheduler
 from .block_reader import (
     BlockLayout,
     BlockReader,
-    UnifiedParamsBlockReader,
     TieredCacheBlockReader,
     parse_block_row_components,
     resolve_block_reader_backend,
@@ -38,7 +37,6 @@ __all__ = [
     'TSPScheduler',
     'BlockLayout',
     'BlockReader',
-    'UnifiedParamsBlockReader',
     'TieredCacheBlockReader',
     'parse_block_row_components',
     'resolve_block_reader_backend',

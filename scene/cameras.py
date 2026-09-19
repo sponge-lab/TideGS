@@ -13,7 +13,7 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
-from utils.general_utils import get_args, get_log_file
+from utils.general_utils import get_log_file
 import utils.general_utils as utils
 import time
 import math
@@ -50,6 +50,7 @@ class Camera(nn.Module):
         uid,
         trans=np.array([0.0, 0.0, 0.0]),
         scale=1.0,
+        args=None,
         offload=False,
     ):
         super(Camera, self).__init__()
@@ -63,10 +64,9 @@ class Camera(nn.Module):
         self.image_name = image_name
         self.device = "cpu" if offload else "cuda"
 
-        args = get_args()
         log_file = get_log_file()
 
-        if args.time_image_loading:
+        if args is not None and args.time_image_loading:
             start_time = time.time()
 
         # Single GPU mode - always load
@@ -75,7 +75,7 @@ class Camera(nn.Module):
         self.image_width = self.original_image_backup.shape[2]
         self.image_height = self.original_image_backup.shape[1]
 
-        if args.time_image_loading:
+        if args is not None and args.time_image_loading:
             log_file.write(f"Image processing in {time.time() - start_time} seconds\n")
 
         self.zfar = 100.0

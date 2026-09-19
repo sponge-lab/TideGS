@@ -449,7 +449,6 @@ class GPUWorkingSet:
         visible_block_ids: List[int],
         active_blocks_ram: Optional[Dict[int, torch.Tensor]] = None,
         enable_retention: bool = True,
-        unified_params: 'torch.Tensor | None' = None,
         block_reader: 'Optional[object]' = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
         """
@@ -463,13 +462,10 @@ class GPUWorkingSet:
             active_blocks_ram: [Fallback] Dict {block_id: tensor(block_size, 59)} from the
                 TieredCache prefetch.  Only used when ``block_reader`` is ``None``.
             enable_retention: If True, reuse resident overlap; if False, load all from RAM
-            unified_params: [Fallback] Optional _unified_params tensor (N, 59) on CPU pinned
-                memory.  Only used when ``block_reader`` is ``None``.
-                Layout: xyz(3)|opacity(1)|scaling(3)|rotation(4)|dc(3)|rest(45)
             block_reader: Preferred source for cold-block reads.  Must implement the
                 ``BlockReader`` protocol from ``storage.block_reader`` and expose a
                 ``layout`` attribute (``BlockLayout.UNIFIED`` or ``BlockLayout.CACHE``).
-                When provided, it supersedes both older parameters.
+                When provided, it supersedes active_blocks_ram.
             
         Returns:
             Tuple of:
@@ -480,8 +476,6 @@ class GPUWorkingSet:
         # reports the current total count.
         if block_reader is not None:
             self.refresh_topology(int(block_reader.total_gaussians))
-        elif unified_params is not None:
-            self.refresh_topology(int(unified_params.shape[0]))
 
         visible_set = set(int(block_id) for block_id in visible_block_ids if 0 <= int(block_id) < self.num_blocks)
         previous_set = set(self.previous_blocks)
@@ -553,10 +547,9 @@ class GPUWorkingSet:
         #   handoff point after writeback, so re-read from the CPU-side source.
         #
         # We treat every BlockReader-backed flow as CPU-cache-backed for direct
-        # GPU reuse purposes: the canonical CPU tensor (either a fallback
-        # unified_params slice or a TieredCache entry) is the source of truth
-        # between iterations.
-        ssd_mode = (block_reader is not None) or (unified_params is not None)
+        # GPU reuse purposes: the TieredCache entry is the source of truth
+        # between iterations in the synchronous fallback.
+        ssd_mode = block_reader is not None
         can_use_gpu_hotspots = (
             not ssd_mode
             and hotspot_count > 0
@@ -643,8 +636,6 @@ class GPUWorkingSet:
             elif cold_blocks_source is not None and block_id in cold_blocks_source:
                 # ============================================================
                 # COLD via BlockReader: layout determined by reader backend.
-                # UnifiedParamsBlockReader  -> xyz | opacity | scale | rot | dc | rest
-                # TieredCacheBlockReader    -> xyz | scale   | rot   | opacity | dc | rest
                 # ============================================================
                 block_tensor = cold_blocks_source[block_id][:block_len]
                 src_gpu = block_tensor.to(self.device, non_blocking=True)
@@ -663,17 +654,6 @@ class GPUWorkingSet:
                     new_opacity[s] = src_gpu[:, 10:11]
                     new_features_dc[s] = src_gpu[:, 11:14]
                     new_features_rest[s] = src_gpu[:, 14:59]
-            elif unified_params is not None:
-                # [Fallback] Read directly from unified_params (CPU pinned)
-                # Layout: xyz(3)|opacity(1)|scaling(3)|rotation(4)|dc(3)|rest(45)
-                src = unified_params.data[start_idx:end_idx]
-                src_gpu = src.to(self.device, non_blocking=True)
-                new_xyz[s] = src_gpu[:, 0:3]
-                new_opacity[s] = src_gpu[:, 3:4]
-                new_scaling[s] = src_gpu[:, 4:7]
-                new_rotation[s] = src_gpu[:, 7:11]
-                new_features_dc[s] = src_gpu[:, 11:14]
-                new_features_rest[s] = src_gpu[:, 14:59]
             elif active_blocks_ram is not None and block_id in active_blocks_ram:
                 # [Fallback] From TieredCache-style dict; cache layout.
                 block_tensor = active_blocks_ram[block_id]  # (block_size, 59) CPU
@@ -692,7 +672,7 @@ class GPUWorkingSet:
                 new_opacity[s].zero_()
                 new_features_dc[s].zero_()
                 new_features_rest[s].zero_()
-                print(f"[WARNING] Block {block_id} not reachable via any source (reader/unified_params/active_blocks_ram)")
+                print(f"[WARNING] Block {block_id} not reachable via block_reader/active_blocks_ram")
             
             # Record slice mapping
             self.block_to_gpu_slice[block_id] = s
@@ -788,48 +768,6 @@ class GPUWorkingSet:
             'bandwidth_savings_ratio': avg_hit_rate,  # Approx savings
         }
     
-    def update_ram_cache(
-        self,
-        geometry_cache: Dict[str, torch.Tensor],
-        sh_cache: torch.Tensor
-    ):
-        """
-        Update RAM cache with modified GPU parameters (after optimizer step).
-        
-        This updates all parameter types:
-        - Geometry: xyz, scaling, rotation, opacity
-        - SH: features_dc, features_rest
-        
-        Args:
-            geometry_cache: Dict with keys ['xyz', 'scaling', 'rotation', 'opacity']
-                           Each value is a CPU tensor (N, dim) - will be updated in-place
-            sh_cache: Full SH parameter cache in RAM (N, 48) - will be updated in-place
-        """
-        if self.gpu_xyz is None:
-            print("[GPUWorkingSet] Warning: No parameters to update (empty working set)")
-            return
-        
-        # Get global indices for scatter operation
-        global_ids = self.local_to_global_idx.cpu().numpy()
-        
-        # ====================================================================
-        # Update geometry parameters: GPU → CPU RAM
-        # ====================================================================
-        geometry_cache['xyz'][global_ids] = self.gpu_xyz.detach().cpu()
-        geometry_cache['scaling'][global_ids] = self.gpu_scaling.detach().cpu()
-        geometry_cache['rotation'][global_ids] = self.gpu_rotation.detach().cpu()
-        geometry_cache['opacity'][global_ids] = self.gpu_opacity.detach().cpu()
-        
-        # ====================================================================
-        # Update SH parameters: GPU → CPU RAM
-        # ====================================================================
-        # Concatenate DC and Rest
-        gpu_sh_params = torch.cat([self.gpu_features_dc, self.gpu_features_rest], dim=1)  # (M, 48)
-        cpu_sh_params = gpu_sh_params.detach().cpu()
-        sh_cache[global_ids] = cpu_sh_params
-        
-        self._log(f"[GPUWorkingSet] Updated RAM cache for {len(global_ids):,} Gaussians")
-        self._log("[GPUWorkingSet] Updated all parameters: geometry(11 dims) + SH(48 dims)")
     
     def get_working_set_size(self) -> Dict[str, float]:
         """Get current GPU memory usage statistics."""
@@ -895,31 +833,34 @@ class GPUWorkingSet:
     def stage_updated_blocks(
         self,
         updated_block_ids: List[int],
+        *,
+        source_buffer,
     ) -> Optional[PendingBlockWriteback]:
         """Pack updated blocks and enqueue one batched D2H copy."""
         sources = {
-            'xyz': self.gpu_xyz,
-            'scaling': self.gpu_scaling,
-            'rotation': self.gpu_rotation,
-            'opacity': self.gpu_opacity,
-            'features_dc': self.gpu_features_dc,
-            'features_rest': self.gpu_features_rest,
+            name: getattr(source_buffer, name)
+            for name in PendingBlockWriteback.COMPONENT_ORDER
         }
-        if not updated_block_ids or any(tensor is None for tensor in sources.values()):
+        if not updated_block_ids:
             return None
+        if any(tensor is None for tensor in sources.values()):
+            raise RuntimeError("Cannot stage dirty blocks from an empty GPU buffer")
 
         plans = []
         local_slices = []
         for block_id in sorted(set(int(block_id) for block_id in updated_block_ids)):
-            local_slice = self.block_to_gpu_slice.get(block_id)
+            local_slice = source_buffer.block_to_local_slice.get(block_id)
             if local_slice is None:
-                continue
+                raise RuntimeError(f"Dirty block {block_id} is absent from the active GPU buffer")
             global_start = block_id * self.block_size
             expected_rows = min(self.block_size, self.num_total - global_start)
             local_rows = int(local_slice.stop - local_slice.start)
-            row_count = min(expected_rows, local_rows)
-            if row_count <= 0:
-                continue
+            if expected_rows <= 0 or local_rows != expected_rows or any(
+                local_slice.start < 0 or local_slice.stop > tensor.shape[0]
+                for tensor in sources.values()
+            ):
+                raise RuntimeError(f"Invalid GPU slice for dirty block {block_id}: {local_slice}")
+            row_count = expected_rows
             plans.append((block_id, row_count))
             local_slices.append(slice(local_slice.start, local_slice.start + row_count))
         if not plans:
@@ -984,7 +925,7 @@ class GPUWorkingSet:
             packed_cpu,
             ready_event,
             release_event=release_event,
-            gpu_refs=[packed_gpu, source_starts, row_counts, output_starts],
+            gpu_refs=[packed_gpu, source_starts, row_counts, output_starts, *sources.values()],
         )
 
     def stage_block_bounds(

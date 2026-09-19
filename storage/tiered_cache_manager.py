@@ -142,6 +142,7 @@ class TieredCacheManager:
             'inflight_wait_blocks': 0,
             'inflight_wait_time': 0.0,
             'inflight_fallback_blocks': 0,
+            'stale_read_retries': 0,
         }
 
         # Start async worker threads
@@ -189,23 +190,20 @@ class TieredCacheManager:
             if tensor is not None:
                 self.cache_data.move_to_end(block_id)
                 return tensor, 'cache'
+            with self.flushing_lock:
+                flushing_entry = self.flushing_buffer.get(block_id)
+                if flushing_entry is None:
+                    return None, None
 
-        with self.flushing_lock:
-            flushing_entry = self.flushing_buffer.get(block_id)
-
-        if flushing_entry is None:
-            return None, None
-
-        tensor, _, _ = flushing_entry
-        if promote_flushing:
-            with self.cache_lock:
-                cached_tensor = self.cache_data.get(block_id)
-                if cached_tensor is not None:
+                tensor, _, version = flushing_entry
+                if promote_flushing:
+                    self.cache_data[block_id] = tensor
                     self.cache_data.move_to_end(block_id)
-                    return cached_tensor, 'cache'
-                self.cache_data[block_id] = tensor
-                self.cache_data.move_to_end(block_id)
-        return tensor, 'flushing'
+                    self.block_versions[block_id] = max(
+                        self.block_versions.get(block_id, 0), version
+                    )
+                    return tensor, 'flushing'
+                return tensor, 'flushing'
 
     def _reserve_inflight_read(self, block_id: int) -> Tuple[threading.Event, bool]:
         """Reserve the right to read one block from SSD."""
@@ -266,18 +264,92 @@ class TieredCacheManager:
         if not to_read:
             return 0, 0.0
 
-        t0 = time.time()
+        get_block_versions = getattr(self.storage, "get_block_versions", None)
+        pending = list(to_read)
+        total_elapsed = 0.0
+        max_attempts = 3
         try:
-            loaded = self.storage.read_blocks(to_read)
-            elapsed = time.time() - t0
+            for attempt in range(max_attempts):
+                storage_versions_before = {}
+                if callable(get_block_versions):
+                    storage_versions_before = get_block_versions(pending)
 
-            with self.cache_lock:
-                for block_id, tensor in loaded.items():
-                    self.cache_data[block_id] = tensor
-                    self.cache_data.move_to_end(block_id)
-                    result[block_id] = tensor
+                with self.cache_lock:
+                    with self.flushing_lock:
+                        local_versions_before = {
+                            block_id: self.block_versions.get(
+                                block_id,
+                                storage_versions_before.get(block_id, 0),
+                            )
+                            for block_id in pending
+                        }
 
-            return len(to_read), elapsed
+                t0 = time.time()
+                loaded = self.storage.read_blocks(pending)
+                total_elapsed += time.time() - t0
+
+                storage_versions_after = {}
+                if callable(get_block_versions):
+                    storage_versions_after = get_block_versions(pending)
+
+                retry_ids = []
+                with self.cache_lock:
+                    with self.flushing_lock:
+                        for block_id, tensor in loaded.items():
+                            current = self.cache_data.get(block_id)
+                            if current is not None:
+                                self.cache_data.move_to_end(block_id)
+                                result[block_id] = current
+                                continue
+
+                            flushing_entry = self.flushing_buffer.get(block_id)
+                            if flushing_entry is not None:
+                                current, _, version = flushing_entry
+                                self.cache_data[block_id] = current
+                                self.cache_data.move_to_end(block_id)
+                                self.block_versions[block_id] = max(
+                                    self.block_versions.get(block_id, 0), version
+                                )
+                                result[block_id] = current
+                                continue
+
+                            before_storage = storage_versions_before.get(block_id)
+                            after_storage = storage_versions_after.get(block_id)
+                            before_local = local_versions_before[block_id]
+                            current_local = self.block_versions.get(
+                                block_id,
+                                before_storage if before_storage is not None else 0,
+                            )
+                            storage_changed = (
+                                before_storage is not None
+                                and after_storage is not None
+                                and before_storage != after_storage
+                            )
+                            local_changed = current_local != before_local
+                            if storage_changed or local_changed:
+                                retry_ids.append(block_id)
+                                continue
+
+                            published_version = (
+                                after_storage
+                                if after_storage is not None
+                                else current_local
+                            )
+                            self.cache_data[block_id] = tensor
+                            self.cache_data.move_to_end(block_id)
+                            self.block_versions[block_id] = published_version
+                            result[block_id] = tensor
+
+                if not retry_ids:
+                    return len(to_read), total_elapsed
+
+                self.stats['stale_read_retries'] += len(retry_ids)
+                pending = retry_ids
+
+            raise RuntimeError(
+                "SSD block read kept racing with newer cache/storage versions: "
+                f"{pending}"
+            )
         finally:
             self._complete_inflight_reads(to_read)
 
@@ -294,7 +366,10 @@ class TieredCacheManager:
         block_versions = block_versions or {}
         t0 = time.time()
         try:
-            self.storage.write_patch(dirty_blocks)
+            self.storage.write_patch(
+                dirty_blocks,
+                block_versions=block_versions,
+            )
             elapsed = time.time() - t0
 
             with self.flushing_lock:
@@ -391,16 +466,12 @@ class TieredCacheManager:
                         to_load.append(block_id)
 
                 if to_load:
-                    loaded = self.storage.read_blocks(to_load)
-                    with self.cache_lock:
-                        for block_id, tensor in loaded.items():
-                            with self.flushing_lock:
-                                if block_id in self.flushing_buffer:
-                                    continue
-                            if block_id not in self.cache_data:
-                                self.cache_data[block_id] = tensor
-                                self.cache_data.move_to_end(block_id)
-                                loaded_count += 1
+                    future_result = {}
+                    loaded_count, _ = self._read_claimed_blocks(
+                        to_load,
+                        future_result,
+                        [],
+                    )
 
                 elapsed = time.time() - t0
                 self.stats['future_prefetch_jobs'] += 1
@@ -821,31 +892,28 @@ class TieredCacheManager:
         dirty_versions = {}
 
         with self.cache_lock:
-            # Select victims from LRU tail
-            for _ in range(min(num_blocks, len(self.cache_data))):
-                if not self.cache_data:
-                    break
-
-                # Pop from front (oldest)
-                block_id, tensor = self.cache_data.popitem(last=False)
-                victims.append(block_id)
-
-                # Check if dirty
-                if block_id in self.dirty_set:
-                    if not self._is_valid_block_tensor(block_id, tensor, 'evict_and_flush'):
-                        self.dirty_set.discard(block_id)
-                        continue
-                    dirty_victims[block_id] = tensor
-                    dirty_versions[block_id] = self.block_versions.get(block_id, 0)
-        
-        # [FIX] Move dirty victims to flushing buffer BEFORE releasing lock
-        # This ensures prefetch can find them during SSD write
-        if dirty_victims:
             with self.flushing_lock:
-                current_time = time.time()
-                for block_id, tensor in dirty_victims.items():
-                    version = dirty_versions.get(block_id, self.block_versions.get(block_id, 0))
-                    self.flushing_buffer[block_id] = (tensor, current_time, version)
+                # Select victims from LRU tail and publish dirty ownership
+                # before releasing either state lock.
+                for _ in range(min(num_blocks, len(self.cache_data))):
+                    if not self.cache_data:
+                        break
+
+                    block_id, tensor = self.cache_data.popitem(last=False)
+                    victims.append(block_id)
+
+                    if block_id in self.dirty_set:
+                        if not self._is_valid_block_tensor(block_id, tensor, 'evict_and_flush'):
+                            self.dirty_set.discard(block_id)
+                            continue
+                        version = self.block_versions.get(block_id, 0)
+                        dirty_victims[block_id] = tensor
+                        dirty_versions[block_id] = version
+                        self.flushing_buffer[block_id] = (
+                            tensor,
+                            time.time(),
+                            version,
+                        )
 
         # Flush dirty blocks to SSD on the background writeback worker.
         if dirty_victims:

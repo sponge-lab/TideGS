@@ -17,6 +17,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
+import utils.general_utils as utils
 
 
 PARAM_DIM = 59
@@ -66,10 +67,7 @@ def resident_policy_resume_message(manifest: Dict[str, Any], args) -> str:
 
 
 def _log(message: str, log_file=None) -> None:
-    print(message)
-    if log_file is not None:
-        log_file.write(message + "\n")
-        log_file.flush()
+    utils.log_and_print(message, log_file)
 
 
 def _jsonable(value: Any) -> Any:
@@ -346,7 +344,7 @@ def write_pure_ssd_snapshot_checkpoint(
         "scene_max": np.asarray(scene_max, dtype=np.float32).tolist(),
         "resident_policy": build_resident_policy_config(args),
         "args": {
-            "ssd_execution_mode": getattr(args, "ssd_execution_mode", None),
+            "storage_mode": "tide",
             "paper_optimizer_backend": getattr(args, "paper_optimizer_backend", None),
             "paper_optimizer_state_mode": getattr(args, "paper_optimizer_state_mode", None),
             "paper_block_reader_backend": getattr(args, "paper_block_reader_backend", None),
@@ -485,7 +483,7 @@ def write_pure_ssd_incremental_checkpoint(
         "scene_max": np.asarray(scene_max, dtype=np.float32).tolist(),
         "resident_policy": build_resident_policy_config(args),
         "args": {
-            "ssd_execution_mode": getattr(args, "ssd_execution_mode", None),
+            "storage_mode": "tide",
             "paper_optimizer_backend": getattr(args, "paper_optimizer_backend", None),
             "paper_optimizer_state_mode": getattr(args, "paper_optimizer_state_mode", None),
             "paper_block_reader_backend": getattr(args, "paper_block_reader_backend", None),
@@ -494,7 +492,8 @@ def write_pure_ssd_incremental_checkpoint(
             "pure_ssd_checkpoint_patch_mode": patch_file_mode,
             "pure_ssd_checkpoint_keep_last": getattr(args, "pure_ssd_checkpoint_keep_last", None),
             "tide_storage_max_patch_files": getattr(args, "tide_storage_max_patch_files", None),
-            "tide_storage_max_patch_gb": getattr(args, "tide_storage_max_patch_gb", None),
+            "tide_storage_max_stale_patch_gb": getattr(args, "tide_storage_max_stale_patch_gb", None),
+            "tide_storage_max_patch_total_gb": getattr(args, "tide_storage_max_patch_total_gb", None),
             "tide_storage_min_free_gb": getattr(args, "tide_storage_min_free_gb", None),
         },
     }

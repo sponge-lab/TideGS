@@ -88,10 +88,7 @@ class TideGaussianModel(BaseGaussianModel):
             N = sub_N
 
         def _log_init_progress(message: str):
-            print(message)
-            if log_file is not None:
-                log_file.write(message + "\n")
-                log_file.flush()
+            utils.log_and_print(message, log_file)
 
         debug_fast_init_scales = getattr(self.args, "debug_fast_init_scales", False)
 
@@ -130,27 +127,13 @@ class TideGaussianModel(BaseGaussianModel):
 
         print(f"[PURE SSD INIT] Initialization tensors on CPU, N={N:,}")
 
-        # Large paper-mode runs (for example billion-scale measurements) can
-        # exceed CUDA host-allocation limits if we pin the full geometry tensors at
-        # startup. When the geometry state becomes very large, fall back to ordinary
-        # CPU tensors and rely on the block-wise streaming path during training.
         geometry_state_bytes = N * (3 + 3 + 4 + 1) * 4
         disable_auto_densification = getattr(self.args, "disable_auto_densification", False)
-        paper_execution = str(getattr(self.args, "ssd_execution_mode", "fast_ram")).lower() == "paper"
-        paper_free_unified = bool(getattr(self.args, "paper_free_unified_params", False))
-        use_pinned_geometry = not (
-            self.use_gpu_features
-            and (
-                paper_execution
-                or paper_free_unified
-                or geometry_state_bytes > 8 * (1024**3)
-            )
-        )
+        use_pinned_geometry = not self.use_gpu_features
         if not use_pinned_geometry:
             geometry_state_gb = geometry_state_bytes / (1024**3)
-            reason = "paper out-of-core mode" if paper_execution or paper_free_unified else "large geometry state"
             _log_init_progress(
-                f"[OUT-OF-CORE INIT] {reason}: geometry state is {geometry_state_gb:.2f} GB; "
+                f"[OUT-OF-CORE INIT] Tide mode: geometry state is {geometry_state_gb:.2f} GB; "
                 "using ordinary CPU tensors instead of pinned host tensors during initialization."
             )
 
@@ -239,8 +222,6 @@ class TideGaussianModel(BaseGaussianModel):
         else:
             self.max_radii2D = torch.zeros((N), device="cuda")
             self.sum_visible_count_in_one_batch = torch.zeros((N), device="cuda")
-
-        self.param_dims = torch.tensor(dims, dtype=torch.int, device="cuda")
 
     def _refresh_gpu_working_set_topology(self):
         if self.use_gpu_features and hasattr(self, 'gpu_working_set_manager') and self.gpu_working_set_manager is not None:
@@ -365,8 +346,6 @@ class TideGaussianModel(BaseGaussianModel):
         )
         self.max_radii2D = torch.empty((0,), device="cuda")
         self.sum_visible_count_in_one_batch = torch.empty((0,), device="cuda")
-        self.param_dims = torch.tensor([3, 45], dtype=torch.int, device="cuda")
-
         log_file = utils.get_log_file()
         message = (
             f"[PAPER MODE] _unified_params never allocated; streaming SSD base has "
@@ -494,7 +473,6 @@ class TideGaussianModel(BaseGaussianModel):
         backend).
 
         Preconditions (validated at CLI in arguments/__init__.py):
-            * ``ssd_execution_mode == "paper"``
             * ``paper_block_reader_backend != "unified_params"``
             * ``paper_optimizer_backend == "gpu_resident"``
             * ``disable_auto_densification`` (densification still expects the
@@ -628,7 +606,7 @@ class TideGaussianModel(BaseGaussianModel):
             )
             self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
 
-        args = utils.get_args()
+        args = self.args
         log_file = utils.get_log_file()
 
         # ========================================================================
@@ -661,21 +639,9 @@ class TideGaussianModel(BaseGaussianModel):
             
             log_file.write("[PAPER MODE] Concatenating all parameters into unified tensor\n")
             
-            # ================================================================
-            # [CRITICAL FIX] Preserve pinned memory when concatenating
-            # ================================================================
-            # torch.cat() on pinned tensors returns a NON-pinned tensor!
-            # Solution: Create pinned buffer first, then copy data
-            
             N = self._xyz.shape[0]
-            paper_execution_mode = getattr(self.args, 'ssd_execution_mode', 'fast_ram') == 'paper'
-            
-            if paper_execution_mode:
-                unified_buffer = torch.empty((N, 59), dtype=torch.float32)
-                log_file.write("  [PAPER MODE] Using ordinary CPU memory for unified_params (not pinned)\n")
-            else:
-                unified_buffer = torch.empty((N, 59), dtype=torch.float32).pin_memory()
-                log_file.write("  [FAST_RAM MODE] Using pinned CPU memory for unified_params\n")
+            unified_buffer = torch.empty((N, 59), dtype=torch.float32)
+            log_file.write("  [PAPER MODE] Using ordinary CPU memory for unified_params (not pinned)\n")
             
             # Copy each parameter into the buffer
             unified_buffer[:, 0:3] = self._xyz           # (N, 3)
@@ -698,12 +664,7 @@ class TideGaussianModel(BaseGaussianModel):
             
             assert self._unified_params.device.type == 'cpu', \
                 f"unified_params should be on CPU but is on {self._unified_params.device}"
-            if paper_execution_mode:
-                log_file.write("  ✅ Unified params verified on CPU (paper mode, non-pinned allowed)\n")
-            else:
-                assert self._unified_params.is_pinned(), \
-                    f"unified_params should be pinned but is_pinned()={self._unified_params.is_pinned()}"
-                log_file.write("  ✅ Unified params verified as pinned\n")
+            log_file.write("  ✅ Unified params verified on CPU (paper mode, non-pinned allowed)\n")
             
             # Single metadata parameter group for the SSD-backed unified table.
             l = [
@@ -1078,7 +1039,7 @@ class TideGaussianModel(BaseGaussianModel):
         self.active_sh_degree = self.max_sh_degree
 
     def save_sub_plys(self, path, n_split, split_size):
-        args = utils.get_args()
+        args = self.args
         _xyz = _features_dc = _features_rest = _opacity = _scaling = _rotation = None
         utils.log_cpu_memory_usage("start save_ply")
         _xyz = self._xyz
@@ -1200,7 +1161,7 @@ class TideGaussianModel(BaseGaussianModel):
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        args = utils.get_args()
+        args = self.args
 
         if args.drop_initial_3dgs_p > 0.0:
             # drop each point with probability args.drop_initial_3dgs_p

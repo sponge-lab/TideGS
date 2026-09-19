@@ -1,5 +1,5 @@
 """
-Configuration example for SSD offloading system.
+Configuration for the SSD adapter and recommended scene presets.
 
 This file shows recommended settings for different scene scales.
 """
@@ -8,20 +8,20 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-@dataclass
+@dataclass(frozen=True)
 class StorageConfig:
-    """Configuration for storage system."""
+    """Adapter options; None selects scene defaults for block/RAM/cluster sizes."""
 
     # Storage paths
     ssd_cache_dir: str = "./ssd_cache"
     checkpoint_dir: str = "./checkpoints"
 
     # Block configuration
-    block_size: int = 4096  # Points per block
+    block_size: Optional[int] = 4096  # Points per block
     point_dim: int = 59     # Dimension per Gaussian point
 
     # RAM cache configuration
-    max_ram_gb: float = 16.0
+    max_ram_gb: Optional[float] = 16.0
     eviction_threshold: float = 0.8  # Trigger eviction at 80% full
     prefetch_distance: int = 5       # Number of future blocks to prefetch
 
@@ -30,16 +30,26 @@ class StorageConfig:
     use_pinned_memory: bool = True   # Use pinned memory for faster H2D/D2H
 
     # TSP scheduling
-    num_camera_clusters: int = 10
+    num_camera_clusters: Optional[int] = 10
     cameras_per_cluster: int = 10
-
-    # Compaction settings
-    enable_compaction: bool = False  # Enable background compaction
-    compaction_min_patches: int = 20 # Min patches before compaction
 
     # Monitoring
     log_interval: int = 100          # Print stats every N iterations
     save_checkpoint_interval: int = 1000
+
+    skip_camera_clustering: bool = False
+    use_6plane: bool = True
+    max_patch_files: int = 16
+    max_stale_patch_gb: float = 64.0
+    max_patch_total_gb: float = 128.0
+    min_free_gb: float = 64.0
+    debug_logging: bool = False
+    schedule_cache_enabled: bool = True
+    schedule_cache_dir: str = ""
+    fast_init_scales: bool = False
+    init_scale_mode: str = "knn3"  # {knn3, morton_bucket_density_clamped}; see storage/streaming_ply_init.py
+    bucket_bits: int = 10
+    sort_memory_mb: float = 512.0
 
 
 # Preset configurations for different scales
@@ -66,7 +76,6 @@ LARGE_SCENE = StorageConfig(
     prefetch_distance=10,
     num_camera_clusters=20,
     cameras_per_cluster=15,
-    enable_compaction=True
 )
 
 BILLION_SCALE = StorageConfig(
@@ -75,8 +84,6 @@ BILLION_SCALE = StorageConfig(
     prefetch_distance=15,
     num_camera_clusters=50,
     cameras_per_cluster=20,
-    enable_compaction=True,
-    compaction_min_patches=50
 )
 
 

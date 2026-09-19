@@ -56,6 +56,11 @@ FIELDS = [
     "storage_reads",
     "storage_writes",
     "patches_created",
+    "patch_write_jobs",
+    "patch_write_bytes_gb",
+    "patch_write_time_s",
+    "compaction_jobs",
+    "compaction_time_s",
     "storage_total_size_gb",
     "patch_size_gb",
     "end2end_time_s",
@@ -365,6 +370,16 @@ def summarize_log(log_path: Path) -> Dict[str, object]:
                     summary["sync_flush_blocks"] = values["sync_blocks"]
                 if "sync_time" in values:
                     summary["sync_flush_time_s"] = float(values["sync_time"]) / 1000.0
+                if "patch_write_jobs" in values:
+                    summary["patch_write_jobs"] = values["patch_write_jobs"]
+                if "patch_write_bytes" in values:
+                    summary["patch_write_bytes_gb"] = float(values["patch_write_bytes"]) / (1024.0 ** 3)
+                if "patch_write_time" in values:
+                    summary["patch_write_time_s"] = float(values["patch_write_time"]) / 1000.0
+                if "compaction_jobs" in values:
+                    summary["compaction_jobs"] = values["compaction_jobs"]
+                if "compaction_time" in values:
+                    summary["compaction_time_s"] = float(values["compaction_time"]) / 1000.0
             elif "[PAPER PIPELINE CACHE]" in line:
                 values = _kv_numbers(line)
                 if "urgent_blocks" in values:

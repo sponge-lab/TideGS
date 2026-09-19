@@ -24,7 +24,8 @@ class LogStorageLifecycleTest(unittest.TestCase):
             point_dim=3,
             verbose=False,
             max_patch_files=32,
-            max_patch_gb=0,
+            max_stale_patch_gb=0,
+            max_patch_total_gb=0,
             min_free_gb=0,
         )
         base = torch.arange(24, dtype=torch.float32).reshape(8, 3)
@@ -141,6 +142,35 @@ class LogStorageLifecycleTest(unittest.TestCase):
         self.assertEqual(self.storage.get_stats()["compactions"], 1)
         self.assertTrue(torch.equal(self.storage.read_blocks([0])[0], self.block(20)))
 
+    def test_storage_timing_breakdown_tracks_patch_writes_and_compactions(self):
+        self.storage.write_patch({0: self.block(10)})
+        self.storage.write_patch({0: self.block(20)})
+
+        stats = self.storage.get_stats()
+        self.assertEqual(stats["patch_write_jobs"], 2)
+        self.assertGreater(stats["patch_write_bytes"], 0)
+        self.assertGreaterEqual(stats["patch_write_time"], 0.0)
+        self.assertEqual(stats["compactions"], 0)
+        self.assertEqual(stats["compaction_time"], 0.0)
+
+        self.storage.compact_patches(force=True)
+        stats = self.storage.get_stats()
+        self.assertEqual(stats["compactions"], 1)
+        self.assertGreater(stats["compaction_time"], 0.0)
+
+    def test_total_patch_size_triggers_automatic_compaction(self):
+        self.storage.max_patch_files = 32
+        self.storage.max_patch_total_bytes = self.block(0).numel() * self.block(0).element_size()
+
+        self.storage.write_patch({0: self.block(10)})
+        self.storage.write_patch({1: self.block(11)})
+
+        stats = self.storage.get_stats()
+        self.assertEqual(stats["compactions"], 1)
+        self.assertEqual(stats["num_patches"], 1)
+        self.assertTrue(torch.equal(self.storage.read_blocks([0])[0], self.block(10)))
+        self.assertTrue(torch.equal(self.storage.read_blocks([1])[1], self.block(11)))
+
     def test_live_delta_size_does_not_retrigger_compaction(self):
         self.storage.max_stale_patch_bytes = 1
         self.storage.write_patch({0: self.block(10)})
@@ -177,6 +207,15 @@ class LogStorageLifecycleTest(unittest.TestCase):
             with self.assertRaises(StorageCapacityError):
                 self.storage.write_patch({0: self.block(10)})
         self.assertEqual(set(self.storage_dir.iterdir()), before)
+
+    def test_stale_versioned_write_does_not_overwrite_newer_block(self):
+        self.storage.write_patch({0: self.block(20)}, block_versions={0: 2})
+
+        self.storage.write_patch({0: self.block(10)}, block_versions={0: 1})
+
+        self.assertTrue(torch.equal(self.storage.read_blocks([0])[0], self.block(20)))
+        self.assertEqual(self.storage.index[0].version, 2)
+        self.assertEqual(self.storage.get_stats()["num_patches"], 1)
 
     def test_checkpoint_retention_keeps_newest_numeric_directories(self):
         model_path = self.root / "model"

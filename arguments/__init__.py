@@ -13,8 +13,7 @@
 # https://github.com/nyu-systems/CLM-GS
 #
 
-from argparse import ArgumentParser, Namespace
-import sys
+from argparse import ArgumentParser
 import os
 import utils.general_utils as utils
 
@@ -193,12 +192,11 @@ class AuxiliaryParams(ParamGroup):
         self.visualize_ssd_schedule = False  # Generate TSP schedule visualization
         self.ssd_schedule_ordering = "trajectory"  # {trajectory, shuffle}
         self.tide_storage_max_patch_files = 16  # Compact append-only deltas at this file count
-        self.tide_storage_max_patch_gb = 64.0  # Compact after this much stale delta data accumulates
+        self.tide_storage_max_stale_patch_gb = 64.0  # Compact after this much stale delta data accumulates
+        self.tide_storage_max_patch_total_gb = 128.0  # Compact after active patch data reaches this size
         self.tide_storage_min_free_gb = 64.0  # Refuse writes that consume this reserve
         self.pure_ssd_schedule_cache_dir = ""  # Optional persistent cache for pure SSD camera TSP schedules
         self.pure_ssd_disable_schedule_cache = False  # Disable pure SSD camera schedule cache
-        self.enable_hotspot_retention = True  # Enable GPU hotspot retention to reduce RAM→GPU bandwidth
-        self.ssd_execution_mode = "fast_ram"  # {fast_ram, paper}; TideGS routes reads through the SSD→RAM cache path
         self.paper_optimizer_deferred_mode = "off"  # {off, same_iter, cross_iter}; optimizer/writeback defer mode
         self.paper_resident_selection_policy = "topc_balanced_active_first"  # Validated default; topc_balanced remains for legacy reproduction.
         self.paper_resident_lambda = 0.3  # Eq.(5) mixing weight for next-step usefulness vs. recency
@@ -207,8 +205,8 @@ class AuxiliaryParams(ParamGroup):
         self.paper_resident_capacity_blocks = 2048  # resident capacity in blocks
         self.paper_optimizer_state_mode = "full_cpu"  # {full_cpu, resident_blocks}; optimizer-state placement
         self.paper_optimizer_backend = "cpu"  # {cpu, gpu_resident}; optimizer update backend
-        self.paper_block_reader_backend = "auto"  # {auto, unified_params, tiered_cache}; source for per-iteration block reads
-        self.paper_free_unified_params = False  # release _unified_params after init to unlock >100GB scenes; requires paper_block_reader_backend != unified_params and paper_optimizer_backend=gpu_resident
+        self.paper_block_reader_backend = "auto"
+        self.paper_free_unified_params = False
         self.paper_debug_logging = False  # Enable verbose TideGS diagnostics for development runs
         # Public TideGS aliases. These map onto the internal paper_* names for
         # checkpoint and args.json compatibility.
@@ -340,38 +338,6 @@ class DebugParams(ParamGroup):
         super().__init__(parser, "Debug Parameters")
 
 
-def get_combined_args(parser: ArgumentParser, auto_find_cfg_args_path=False):
-    cmdlne_string = sys.argv[1:]
-    cfgfile_string = "Namespace()"
-    args_cmdline = parser.parse_args(cmdlne_string)
-
-    try:
-        if auto_find_cfg_args_path:
-            if hasattr(args_cmdline, "load_ply_path"):
-                path = args_cmdline.load_ply_path
-                while not os.path.exists(
-                    os.path.join(path, "cfg_args")
-                ) and os.path.exists(path):
-                    path = os.path.join(path, "..")
-                cfgfilepath = os.path.join(path, "cfg_args")
-        else:
-            cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
-        print("Looking for config file in", cfgfilepath)
-        with open(cfgfilepath) as cfg_file:
-            print("Config file found: {}".format(cfgfilepath))
-            cfgfile_string = cfg_file.read()
-    except TypeError:
-        print("Config file not found at")
-        pass
-    args_cfgfile = eval(cfgfile_string)
-
-    merged_dict = vars(args_cfgfile).copy()
-    for k, v in vars(args_cmdline).items():
-        if v != None:
-            merged_dict[k] = v
-    return Namespace(**merged_dict)
-
-
 def print_all_args(args, log_file):
     # print all arguments in a readable format, each argument in a line.
     log_file.write("arguments:\n")
@@ -423,8 +389,6 @@ def _apply_pure_ssd_release_defaults(args):
 
     if str(getattr(args, "pure_ssd_init_backend", "auto")).lower() == "auto":
         args.pure_ssd_init_backend = "streaming"
-    if str(getattr(args, "ssd_execution_mode", "fast_ram")).lower() == "fast_ram":
-        args.ssd_execution_mode = "paper"
     if str(getattr(args, "paper_block_reader_backend", "auto")).lower() == "auto":
         args.paper_block_reader_backend = "tiered_cache"
     if str(getattr(args, "paper_optimizer_backend", "cpu")).lower() == "cpu":
@@ -470,11 +434,6 @@ def init_args(args):
     # Logging are saved with where model is saved.
     args.log_folder = args.model_path
 
-    if hasattr(args, "ssd_execution_mode"):
-        args.ssd_execution_mode = str(args.ssd_execution_mode).lower()
-        assert args.ssd_execution_mode in {"fast_ram", "paper"}, (
-            f"Invalid ssd_execution_mode={args.ssd_execution_mode!r}; expected one of fast_ram, paper"
-        )
     if hasattr(args, "paper_optimizer_deferred_mode"):
         args.paper_optimizer_deferred_mode = str(args.paper_optimizer_deferred_mode).lower()
         assert args.paper_optimizer_deferred_mode in {"off", "same_iter", "cross_iter"}, (
@@ -549,22 +508,14 @@ def init_args(args):
 
     if hasattr(args, "paper_block_reader_backend"):
         args.paper_block_reader_backend = str(args.paper_block_reader_backend).lower()
-        assert args.paper_block_reader_backend in {"auto", "unified_params", "tiered_cache"}, (
+        assert args.paper_block_reader_backend in {"auto", "tiered_cache"}, (
             "Invalid paper_block_reader_backend="
-            f"{args.paper_block_reader_backend!r}; expected one of auto, unified_params, tiered_cache"
+            f"{args.paper_block_reader_backend!r}; expected one of auto, tiered_cache"
         )
 
     if hasattr(args, "paper_free_unified_params"):
         args.paper_free_unified_params = bool(args.paper_free_unified_params)
         if args.paper_free_unified_params:
-            assert getattr(args, "ssd_execution_mode", "fast_ram") == "paper", (
-                "paper_free_unified_params=True requires --ssd_execution_mode paper"
-            )
-            assert getattr(args, "paper_block_reader_backend", "auto") != "unified_params", (
-                "paper_free_unified_params=True is incompatible with "
-                "--paper_block_reader_backend unified_params (freeing the tensor "
-                "would break the reader); use 'auto' or 'tiered_cache'"
-            )
             assert getattr(args, "paper_optimizer_backend", "cpu") == "gpu_resident", (
                 "paper_free_unified_params=True currently requires "
                 "--paper_optimizer_backend gpu_resident (the CPU-Adam backend "
@@ -641,9 +592,12 @@ def init_args(args):
     if hasattr(args, "tide_storage_max_patch_files"):
         args.tide_storage_max_patch_files = int(args.tide_storage_max_patch_files)
         assert args.tide_storage_max_patch_files >= 2
-    if hasattr(args, "tide_storage_max_patch_gb"):
-        args.tide_storage_max_patch_gb = float(args.tide_storage_max_patch_gb)
-        assert args.tide_storage_max_patch_gb >= 0
+    if hasattr(args, "tide_storage_max_stale_patch_gb"):
+        args.tide_storage_max_stale_patch_gb = float(args.tide_storage_max_stale_patch_gb)
+        assert args.tide_storage_max_stale_patch_gb >= 0
+    if hasattr(args, "tide_storage_max_patch_total_gb"):
+        args.tide_storage_max_patch_total_gb = float(args.tide_storage_max_patch_total_gb)
+        assert args.tide_storage_max_patch_total_gb >= 0
     if hasattr(args, "tide_storage_min_free_gb"):
         args.tide_storage_min_free_gb = float(args.tide_storage_min_free_gb)
         assert args.tide_storage_min_free_gb >= 0
@@ -682,9 +636,6 @@ def init_args(args):
         )
         assert not getattr(args, "naive_offload", False) and not getattr(args, "no_offload", False), (
             "pure SSD offload is incompatible with --naive_offload and --no_offload"
-        )
-        assert getattr(args, "ssd_execution_mode", "fast_ram") == "paper", (
-            "pure SSD offload requires --ssd_execution_mode paper"
         )
         assert getattr(args, "paper_block_reader_backend", "auto") == "tiered_cache", (
             "pure SSD offload requires --paper_block_reader_backend tiered_cache"
@@ -751,3 +702,4 @@ def init_args(args):
 
     # Set up global args
     utils.set_args(args)
+    return args

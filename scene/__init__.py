@@ -163,8 +163,10 @@ class Scene:
                     args.source_path, f"decoded_{args.images}"
                 )
                 os.makedirs(args.decode_dataset_path, exist_ok=True)
-                print("create folder: ", args.decode_dataset_path)
-                log_file.write(f"create folder: {args.decode_dataset_path}\n")
+                utils.log_and_print(
+                    f"create folder: {args.decode_dataset_path}",
+                    log_file,
+                )
 
             self.decode_dataset_path = os.path.join(
                 args.decode_dataset_path, "dataset_raw"
@@ -522,7 +524,7 @@ def custom_collate_fn(batch):
 
 
 class OffloadSceneDataset(Dataset):
-    def __init__(self, cameras_info):
+    def __init__(self, cameras_info, args):
         self.cameras_info = cameras_info
         self.camera_size = len(self.cameras_info)
 
@@ -533,7 +535,7 @@ class OffloadSceneDataset(Dataset):
         self.epoch_loss = []
 
         self.log_file = utils.get_log_file()
-        self.args = utils.get_args()
+        self.args = args
 
         self.last_time_point = None
         self.epoch_time = []

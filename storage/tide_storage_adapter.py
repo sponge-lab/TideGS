@@ -22,10 +22,9 @@ import torch
 from sklearn.cluster import KMeans
 
 from .async_pipeline import AsyncPipeline, TSPScheduler
-from .config import get_config_for_scene_size
+from .config import StorageConfig, get_config_for_scene_size
 from .gaussian_block import FrustumCuller
 from .log_storage_manager import LogStorageManager
-from .schedule_utils import get_current_and_next_camera_batches
 from .streaming_ply_init import read_binary_ply_header, streaming_ply_to_ssd_base
 from .tiered_cache_manager import TieredCacheManager
 
@@ -87,49 +86,26 @@ class TideStorageAdapter:
         self,
         gaussians,
         cameras: List,
-        storage_dir: str,
-        num_clusters: Optional[int] = None,
-        max_ram_gb: Optional[float] = None,
-        block_size: Optional[int] = None,
-        skip_camera_clustering: bool = False,
-        use_6plane: bool = True,
-        execution_mode: str = "paper",
-        max_patch_files: int = 16,
-        max_patch_gb: float = 64.0,
-        min_free_gb: float = 64.0,
+        config: StorageConfig,
     ):
+        self.config = config
         self.gaussians = gaussians
         self.cameras = cameras
-        self.skip_camera_clustering = skip_camera_clustering
-        self.use_6plane = use_6plane
-        self.execution_mode = str(execution_mode).lower()
-        self.max_patch_files = int(max_patch_files)
-        self.max_patch_gb = float(max_patch_gb)
-        self.min_free_gb = float(min_free_gb)
-        self.paper_debug_logging = bool(
-            getattr(getattr(self.gaussians, "args", None), "paper_debug_logging", False)
-        )
-        self.schedule_cache_enabled = not bool(
-            getattr(getattr(self.gaussians, "args", None), "pure_ssd_disable_schedule_cache", False)
-        )
-        schedule_cache_dir = getattr(
-            getattr(self.gaussians, "args", None),
-            "pure_ssd_schedule_cache_dir",
-            "",
-        )
+        self.skip_camera_clustering = config.skip_camera_clustering
+        self.use_6plane = config.use_6plane
+        self.max_patch_files = int(config.max_patch_files)
+        self.max_stale_patch_gb = float(config.max_stale_patch_gb)
+        self.max_patch_total_gb = float(config.max_patch_total_gb)
+        self.min_free_gb = float(config.min_free_gb)
+        self.paper_debug_logging = bool(config.debug_logging)
+        self.schedule_cache_enabled = bool(config.schedule_cache_enabled)
         self.schedule_cache_dir = (
-            Path(schedule_cache_dir)
-            if schedule_cache_dir
-            else Path(storage_dir) / "camera_schedule_cache"
+            Path(config.schedule_cache_dir)
+            if config.schedule_cache_dir
+            else Path(config.ssd_cache_dir) / "camera_schedule_cache"
         )
-        if self.execution_mode != "paper":
-            raise ValueError(
-                f"TideStorageAdapter only supports execution_mode='paper', got {execution_mode!r}"
-            )
 
         self.execution_metrics = {
-            "prefetch_requests": 0,
-            "wait_calls": 0,
             "paper_cache_sync_calls": 0,
             "paper_cache_sync_blocks": 0,
             "paper_cache_sync_staged_blocks": 0,
@@ -160,6 +136,7 @@ class TideStorageAdapter:
         self._bounds_change_log = OrderedDict()
         self._bounds_change_history_limit = 64
         self.streaming_init_manifest = None
+        self._closed = False
 
         resume_manifest = getattr(gaussians, "_pure_ssd_resume_manifest", None)
         use_pure_ssd_resume = bool(getattr(gaussians, "_pure_ssd_resume_pending", False))
@@ -169,18 +146,18 @@ class TideStorageAdapter:
         if use_pure_ssd_resume:
             self._init_from_resume_manifest(
                 resume_manifest=resume_manifest,
-                storage_dir=storage_dir,
-                block_size=block_size,
-                max_ram_gb=max_ram_gb,
-                num_clusters=num_clusters,
+                storage_dir=config.ssd_cache_dir,
+                block_size=config.block_size,
+                max_ram_gb=config.max_ram_gb,
+                num_clusters=config.num_camera_clusters,
             )
         elif use_streaming_init:
             self._init_from_streaming_ply(
                 ply_path=streaming_ply_path,
-                storage_dir=storage_dir,
-                block_size=block_size,
-                max_ram_gb=max_ram_gb,
-                num_clusters=num_clusters,
+                storage_dir=config.ssd_cache_dir,
+                block_size=config.block_size,
+                max_ram_gb=config.max_ram_gb,
+                num_clusters=config.num_camera_clusters,
             )
         else:
             raise RuntimeError(
@@ -193,7 +170,6 @@ class TideStorageAdapter:
         self._log(f"[TideStorageAdapter] Block size: {self.block_size:,}")
         self._log(f"[TideStorageAdapter] RAM cache: {self.max_ram_gb} GB")
         self._log(f"[TideStorageAdapter] Camera clusters: {self.num_clusters}")
-        self._log(f"[TideStorageAdapter] Execution mode: {self.execution_mode}")
 
         self._initialize_storage()
         self._start_cache_commit_worker()
@@ -234,6 +210,11 @@ class TideStorageAdapter:
                     updated_blocks,
                     refresh_bounds=not job.bounds_managed_externally,
                 )
+                if job.result != len(job.block_ids):
+                    raise RuntimeError(
+                        f"Incomplete cache commit: expected={len(job.block_ids)} "
+                        f"committed={job.result}"
+                    )
             except Exception as exc:
                 job.error = exc
                 self._cache_commit_error = exc
@@ -298,6 +279,7 @@ class TideStorageAdapter:
         *,
         bounds_managed_externally: bool = False,
     ) -> int:
+        self.check_writeback_error()
         block_ids = list(getattr(payload, "block_ids", []))
         if not block_ids:
             release = getattr(payload, "release", None)
@@ -324,34 +306,60 @@ class TideStorageAdapter:
 
     def flush_resident_dirty(self) -> int:
         resident_state = self._resident_state
-        working_set = self._resident_working_set
-        if resident_state is None or working_set is None:
+        if resident_state is None:
+            self.drain_cache_writebacks()
             return 0
 
-        dirty_blocks = resident_state.dirty_blocks()
-        if not dirty_blocks:
+        resident_state.synchronize_prefetch()
+        return self.writeback_resident_blocks(
+            resident_state.dirty_blocks(), wait=True,
+            bounds_managed_externally=False,
+        )
+
+    def writeback_resident_blocks(
+        self, block_ids: List[int], *, wait: bool = False,
+        bounds_managed_externally: bool = True,
+    ) -> int:
+        self.check_writeback_error()
+        block_ids = sorted(set(int(block_id) for block_id in block_ids))
+        if not block_ids:
+            if wait:
+                self.drain_cache_writebacks()
             return 0
-        payload = working_set.stage_updated_blocks(dirty_blocks)
-        if payload is None or set(payload.block_ids) != set(dirty_blocks):
+
+        resident_state = self._resident_state
+        payload = self._resident_working_set.stage_updated_blocks(
+            block_ids, source_buffer=resident_state.active_buffer,
+        )
+        try:
             staged_ids = [] if payload is None else payload.block_ids
-            raise RuntimeError(
-                "Cannot flush all GPU-dirty resident blocks: "
-                f"dirty={dirty_blocks[:8]} staged={staged_ids[:8]}"
+            if set(staged_ids) != set(block_ids):
+                raise RuntimeError(
+                    "Incomplete GPU resident writeback: "
+                    f"requested={block_ids[:8]} staged={staged_ids[:8]}"
+                )
+            staged = self.submit_cache_writeback(
+                payload, bounds_managed_externally=bounds_managed_externally,
             )
-        staged = self.submit_cache_writeback(payload)
-        if staged != len(dirty_blocks):
-            raise RuntimeError(
-                f"GPU-dirty flush staged {staged}/{len(dirty_blocks)} blocks"
-            )
-        resident_state.mark_blocks_written_back(dirty_blocks)
-        self.drain_cache_writebacks()
+        except Exception:
+            if payload is not None:
+                payload.wait_gpu()
+                payload.release()
+            raise
+        if wait:
+            self.drain_cache_writebacks()
+        resident_state.mark_blocks_written_back(block_ids)
         return staged
 
-    def wait_for_cache_blocks(self, block_ids: List[int]) -> None:
+    def check_writeback_error(self) -> None:
         if self._cache_commit_error is not None:
             raise RuntimeError("background cache commit worker failed") from self._cache_commit_error
+
+    def wait_for_cache_blocks(self, block_ids: List[int]) -> None:
+        self.check_writeback_error()
         requested = set(int(block_id) for block_id in block_ids)
         while requested:
+            self.check_writeback_error()
             with self._cache_commit_lock:
                 jobs = {
                     self._pending_cache_commits[block_id]
@@ -370,6 +378,7 @@ class TideStorageAdapter:
         return [int(block_id) for block_id in block_ids if int(block_id) not in pending]
 
     def wait_for_pending_gpu_copies(self) -> None:
+        self.check_writeback_error()
         with self._cache_commit_lock:
             jobs = set(self._pending_cache_commits.values())
         for job in jobs:
@@ -377,8 +386,7 @@ class TideStorageAdapter:
 
     def drain_cache_writebacks(self) -> None:
         self._cache_commit_queue.join()
-        if self._cache_commit_error is not None:
-            raise RuntimeError("background cache commit worker failed") from self._cache_commit_error
+        self.check_writeback_error()
 
     def _init_from_resume_manifest(
         self,
@@ -465,9 +473,10 @@ class TideStorageAdapter:
             ply_path=ply_path,
             output_dir=self.storage_dir,
             block_size=self.block_size,
-            debug_fast_init_scales=bool(getattr(self.gaussians.args, "debug_fast_init_scales", False)),
-            bucket_bits=int(getattr(self.gaussians.args, "pure_ssd_bucket_bits", 10)),
-            max_sort_memory_mb=float(getattr(self.gaussians.args, "pure_ssd_sort_memory_mb", 512.0)),
+            debug_fast_init_scales=bool(self.config.fast_init_scales),
+            bucket_bits=int(self.config.bucket_bits),
+            max_sort_memory_mb=float(self.config.sort_memory_mb),
+            scale_mode=str(self.config.init_scale_mode),
         )
         self.num_points = int(self.streaming_init_manifest["total_points"])
         self.num_blocks = int(self.streaming_init_manifest["num_blocks"])
@@ -489,7 +498,8 @@ class TideStorageAdapter:
             point_dim=59,
             verbose=self.paper_debug_logging,
             max_patch_files=self.max_patch_files,
-            max_patch_gb=self.max_patch_gb,
+            max_stale_patch_gb=self.max_stale_patch_gb,
+            max_patch_total_gb=self.max_patch_total_gb,
             min_free_gb=self.min_free_gb,
         )
         storage_index = None
@@ -841,38 +851,6 @@ class TideStorageAdapter:
             }
         return generation, camera_blocks
 
-    def prefetch_for_next_iteration(
-        self,
-        iteration: int,
-        batch_size: int,
-        training_schedule: List[int],
-        schedule_ordering: str = "trajectory",
-    ) -> None:
-        self.execution_metrics["prefetch_requests"] += 1
-        current_batch, next_batch = get_current_and_next_camera_batches(
-            training_schedule=training_schedule,
-            iteration=iteration,
-            batch_size=batch_size,
-            schedule_ordering=schedule_ordering,
-        )
-
-        current_blocks = []
-        for cam_id in current_batch.batch_indices:
-            current_blocks.extend(self.get_visible_blocks(cam_id))
-        future_blocks = []
-        for cam_id in next_batch.batch_indices:
-            future_blocks.extend(self.get_visible_blocks(cam_id))
-
-        self.pipeline.request_prefetch(
-            iteration=iteration,
-            needed_blocks=sorted(set(current_blocks)),
-            future_blocks=sorted(set(future_blocks)),
-        )
-
-    def wait_and_load_blocks(self, iteration: int, timeout: float = 30.0) -> Dict[int, torch.Tensor]:
-        self.execution_metrics["wait_calls"] += 1
-        return self.pipeline.wait_for_prefetch(iteration, timeout=timeout)
-
     def refresh_block_bounds_from_blocks(self, updated_blocks_dict: Dict[int, torch.Tensor]) -> int:
         if not updated_blocks_dict:
             return 0
@@ -971,11 +949,6 @@ class TideStorageAdapter:
             self.refresh_block_bounds_from_blocks(updated_blocks_dict)
         return staged_valid
 
-    def async_sync_updated_blocks(self, updated_blocks_dict: Dict[int, torch.Tensor]):
-        if updated_blocks_dict:
-            self.cache.upsert_dirty_block_batch(updated_blocks_dict)
-            self.refresh_block_bounds_from_blocks(updated_blocks_dict)
-
     def get_stats(self) -> Dict:
         return {
             "execution": dict(self.execution_metrics),
@@ -985,20 +958,46 @@ class TideStorageAdapter:
         }
 
     def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._log("[TideStorageAdapter] Shutting down...")
-        self.flush_resident_dirty()
-        self.drain_cache_writebacks()
-        self._cache_commit_queue.put(None)
-        self._cache_commit_queue.join()
+        errors = []
+
+        def run_cleanup(name, cleanup):
+            try:
+                cleanup()
+            except Exception as exc:
+                errors.append((name, exc))
+
+        run_cleanup("flush resident dirty blocks", self.flush_resident_dirty)
+        run_cleanup("drain cache writebacks", self.drain_cache_writebacks)
+        run_cleanup("stop cache commit worker", lambda: self._cache_commit_queue.put(None))
+        run_cleanup("join cache commit queue", self._cache_commit_queue.join)
         if self._cache_commit_thread is not None:
-            self._cache_commit_thread.join(timeout=5.0)
-        self.wait_for_bounds_refresh()
-        self._bounds_refresh_queue.put(None)
-        self._bounds_refresh_queue.join()
+            run_cleanup(
+                "join cache commit thread",
+                lambda: self._cache_commit_thread.join(timeout=5.0),
+            )
+        run_cleanup("wait for bounds refresh", self.wait_for_bounds_refresh)
+        run_cleanup("stop bounds refresh worker", lambda: self._bounds_refresh_queue.put(None))
+        run_cleanup("join bounds refresh queue", self._bounds_refresh_queue.join)
         if self._bounds_refresh_thread is not None:
-            self._bounds_refresh_thread.join(timeout=5.0)
-        self.pipeline.shutdown()
-        self.cache.shutdown()
-        self.storage.maybe_compact(min_patches=2, force=True)
-        self.storage.close()
+            run_cleanup(
+                "join bounds refresh thread",
+                lambda: self._bounds_refresh_thread.join(timeout=5.0),
+            )
+        run_cleanup("shutdown async pipeline", self.pipeline.shutdown)
+        run_cleanup("shutdown cache", self.cache.shutdown)
+        run_cleanup(
+            "compact storage",
+            lambda: self.storage.maybe_compact(min_patches=2, force=True),
+        )
+        run_cleanup("close storage", self.storage.close)
+
+        if errors:
+            details = "; ".join(f"{name}: {exc}" for name, exc in errors)
+            self._log(f"[TideStorageAdapter] Shutdown completed with errors: {details}")
+            raise RuntimeError(f"TideStorageAdapter shutdown failed: {details}") from errors[0][1]
+
         self._log("[TideStorageAdapter] Shutdown complete")

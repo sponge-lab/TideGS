@@ -5,17 +5,13 @@ import gc
 import psutil
 from pathlib import Path
 
-# import faulthandler
-# faulthandler_log = open("fault.log", "w")
-# faulthandler.enable(file=faulthandler_log, all_threads=True)
-
 import torch
 import torch.multiprocessing
 from torch.cuda import nvtx
 from tqdm import tqdm
 
 from utils.mem_monitor import MemMonitor
-from utils.camera_batch_prefetcher import CameraBatchPrefetcher
+from utils.camera_batch_prefetcher import CameraBatchPrefetcher # prefetch 的通道
 from argparse import ArgumentParser
 from arguments import (
     AuxiliaryParams,
@@ -28,25 +24,26 @@ from arguments import (
     init_args,
 )
 
-from scene import Scene, OffloadSceneDataset
+from scene import Scene, OffloadSceneDataset # 按需要读取某个相机的图片，避免一次把全部图片放进内存
 from strategies.tide_engine.gaussian_model import TideGaussianModel
 from strategies.tide_engine.runtime import (
     train_tide_batch,
-    validate_tide_runtime_args,
+    validate_tide_runtime_args, # 检查配置是否满足当前发布路径的要求，例如必须使用指定的 SSD 和 GPU resident 优化模式
 )
 
-from utils.general_utils import safe_state, prepare_output_and_logger
+from utils.general_utils import safe_state, prepare_output_dir
 import utils.general_utils as utils
 from utils.timer import Timer, End2endTimer
 
-from storage.tide_storage_adapter import TideStorageAdapter
-from storage.schedule_utils import get_camera_batch_schedule
+from storage.config import StorageConfig
+from storage.tide_storage_adapter import TideStorageAdapter # 训练与存储之间的连接层。训练需要哪些块、更新了哪些块，通过这里与缓存和磁盘交互 TODO：检查这里的竞争问题
+from storage.schedule_utils import get_camera_batch_schedule # 根据已有的相机顺序、iteration和 batch size，算出这一批该用哪些相机。并不是重新计算整条 TSP 路线。 TODO: check 相机的训练顺序到底是什么样子的
 from storage.pure_ssd_checkpoint import (
-    is_pure_ssd_checkpoint,
+    is_pure_ssd_checkpoint, # 检查目录中有没有对应的 checkpoint manifest 文件
     load_pure_ssd_checkpoint_manifest,
-    prune_checkpoint_history,
+    prune_checkpoint_history, # 按保留数量清理较旧的 checkpoint 目录。这里的 prune 是删除旧存档，不是删除 Gaussian 点
     resident_policy_resume_message,
-    write_pure_ssd_incremental_checkpoint,
+    write_pure_ssd_incremental_checkpoint, # 保存当前存储索引，保留有效的 patch 文件，基础数据仍通过引用使用，以减少全量复制。TODO: check 这里是不是导致存储爆炸的原因，这里的引用的作用是什么
     write_pure_ssd_snapshot_checkpoint,
 )
 
@@ -99,8 +96,6 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
 
     if storage_adapter is None:
         raise RuntimeError("[PURE SSD CHECK] storage_adapter is required")
-    if getattr(storage_adapter, "execution_mode", "fast_ram") != "paper":
-        raise RuntimeError("[PURE SSD CHECK] storage_adapter.execution_mode must be 'paper'")
     if resolved_backend != "tiered_cache":
         raise RuntimeError(
             f"[PURE SSD CHECK] BlockReader backend must be tiered_cache, got {resolved_backend!r}"
@@ -139,17 +134,64 @@ def _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backen
     utils.print_rank_0(message.strip())
 
 
+def _cleanup_training_resources(resources, log_file, *, raise_errors=False):
+    cleanup_steps = [
+        ("optimizer churn log", lambda: resources.get("optimizer_churn_tsv") and resources["optimizer_churn_tsv"].close()),
+        ("camera prefetcher", lambda: resources.get("camera_batch_prefetcher") and resources["camera_batch_prefetcher"].close()),
+        ("progress bar", lambda: resources.get("progress_bar") and resources["progress_bar"].close()),
+        ("memory monitor", lambda: resources.get("mem_mon") and resources["mem_mon"].close()),
+        ("storage adapter", lambda: resources.get("storage_adapter") and resources["storage_adapter"].shutdown()),
+        ("scene", lambda: resources.get("scene") and resources["scene"].clean_up()),
+    ]
+    if resources.get("storage_adapter") is not None:
+        cleanup_steps.insert(-1, ("double buffer GPU", _shutdown_double_buffer_gpu))
+    errors = []
+    for name, cleanup in cleanup_steps:
+        try:
+            cleanup()
+        except Exception as exc:
+            errors.append((name, exc))
+            log_file.write(f"[CLEANUP WARNING] Failed to close {name}: {exc}\n")
+    log_file.flush()
+    if errors and raise_errors:
+        details = "; ".join(f"{name}: {exc}" for name, exc in errors)
+        raise RuntimeError(f"Training cleanup failed: {details}") from errors[0][1]
+
+
+def _shutdown_double_buffer_gpu():
+    from strategies.tide_engine.engine import shutdown_double_buffer_gpu
+
+    shutdown_double_buffer_gpu()
+
+
 def training(dataset_args, opt_args, pipe_args, args, log_file):
+    resources = {}
+    completed = False
+    try:
+        result = _training_impl(dataset_args, opt_args, pipe_args, args, log_file, resources)
+        completed = True
+        return result
+    finally:
+        _cleanup_training_resources(resources, log_file, raise_errors=completed)
+
+
+def _training_impl(dataset_args, opt_args, pipe_args, args, log_file, resources):
     """Main training loop for the pure SSD/Tide release path."""
 
     # ============================================================================
     # STAGE 1: INITIALIZATION
     # ============================================================================
 
-    assert args.dataset_cache_and_stream_mode in [
+    valid_dataset_modes = {
         "load_from_source_on_demand",
         "load_from_disk_on_demand",
-    ], f"Unsupported dataset_cache_and_stream_mode: {args.dataset_cache_and_stream_mode}"
+    }
+    if args.dataset_cache_and_stream_mode not in valid_dataset_modes:
+        raise ValueError(
+            "Unsupported dataset_cache_and_stream_mode: "
+            f"{args.dataset_cache_and_stream_mode!r}. "
+            f"Expected one of: {sorted(valid_dataset_modes)}"
+        )
     try:
         validate_tide_runtime_args(args)
     except RuntimeError as exc:
@@ -162,13 +204,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # ------------------------------------------------------------------------
     gc.set_threshold(700, 10, 500)  # gen0, gen1, gen2
 
-    torch.cuda.set_device(args.gpu)
     timers = Timer(args)
     utils.set_timers(timers)
-    prepare_output_and_logger(dataset_args)
+    prepare_output_dir(dataset_args)
     utils.log_cpu_memory_usage("at the beginning of training")
     start_from_this_iteration = 1
-    pure_ssd_resume_manifest = None
+    pure_ssd_resume_manifest = None # TODO: check 这里的命名
     pure_ssd_prebuilt_manifest = _load_pure_ssd_prebuilt_manifest(args)
     if pure_ssd_prebuilt_manifest is not None and args.start_checkpoint != "":
         raise ValueError(
@@ -184,8 +225,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             f"points={int(pure_ssd_prebuilt_manifest['total_points']):,} "
             f"base={pure_ssd_prebuilt_manifest.get('base_file')}"
         )
-        utils.print_rank_0(prebuilt_msg)
-        log_file.write(prebuilt_msg + "\n")
+        utils.log_and_print(prebuilt_msg, log_file)
     if args.start_checkpoint != "":
         if not is_pure_ssd_checkpoint(args.start_checkpoint):
             raise ValueError(
@@ -200,11 +240,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             f"{args.start_checkpoint} next_iteration={start_from_this_iteration} "
             f"base={pure_ssd_resume_manifest.get('base_file')}"
         )
-        utils.print_rank_0(resume_msg)
-        log_file.write(resume_msg + "\n")
+        utils.log_and_print(resume_msg, log_file)
         policy_msg = resident_policy_resume_message(pure_ssd_resume_manifest, args)
-        utils.print_rank_0(policy_msg)
-        log_file.write(policy_msg + "\n")
+        utils.log_and_print(policy_msg, log_file)
 
     # Configure multiprocessing sharing strategy if needed
     if args.sharing_strategy != "default":
@@ -213,51 +251,56 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # ------------------------------------------------------------------------
     # 1.2: Initialize pure SSD Gaussian shell
     # ------------------------------------------------------------------------
-    gaussians = TideGaussianModel(sh_degree=dataset_args.sh_degree)
-    utils.print_rank_0("Using TideGaussianModel for TideGS/SSD")
-    log_file.write("Using TideGaussianModel for TideGS/SSD\n")
+    gaussians = TideGaussianModel(sh_degree=dataset_args.sh_degree, args=args)
+    utils.log_and_print("Using TideGaussianModel for TideGS/SSD", log_file)
 
     storage_adapter = None
     ssd_training_schedule = None
 
     with torch.no_grad():
         scene = Scene(args, gaussians)
+        resources["scene"] = scene
         utils.print_rank_0("[SSD] Initializing Tide storage engine...")
-        storage_adapter = TideStorageAdapter(
-            gaussians=gaussians,
-            cameras=scene.getTrainCamerasInfo(),
-            storage_dir=args.ssd_cache_dir,
+        storage_config = StorageConfig(
+            ssd_cache_dir=args.ssd_cache_dir,
             block_size=args.gaussian_block_size,
             max_ram_gb=args.max_ram_gb,
-            num_clusters=args.num_clusters,
+            num_camera_clusters=args.num_clusters,
             use_6plane=args.use_6plane,
-            execution_mode=args.ssd_execution_mode,
             max_patch_files=args.tide_storage_max_patch_files,
-            max_patch_gb=args.tide_storage_max_patch_gb,
+            max_stale_patch_gb=args.tide_storage_max_stale_patch_gb,
+            max_patch_total_gb=args.tide_storage_max_patch_total_gb,
             min_free_gb=args.tide_storage_min_free_gb,
+            debug_logging=args.paper_debug_logging,
+            schedule_cache_enabled=not args.pure_ssd_disable_schedule_cache,
+            schedule_cache_dir=args.pure_ssd_schedule_cache_dir,
+            fast_init_scales=args.debug_fast_init_scales,
+            bucket_bits=args.pure_ssd_bucket_bits,
+            sort_memory_mb=args.pure_ssd_sort_memory_mb,
         )
-
-        log_file.write(f"[SSD] Execution mode: {args.ssd_execution_mode}\n")
+        storage_adapter = TideStorageAdapter( # TODO: training w/ SSD, SSD base file, patch file, RAM cache, GPU working set, block bounds, camera schedule, 后台 cache commit worker, 后台bounds refresh worker, asyncpipeline
+            gaussians=gaussians,
+            cameras=scene.getTrainCamerasInfo(),
+            config=storage_config,
+        )
+        resources["storage_adapter"] = storage_adapter
 
         ssd_schedule_ordering = getattr(args, "ssd_schedule_ordering", "trajectory")
         ssd_schedule_shuffle = ssd_schedule_ordering == "shuffle"
         ssd_training_schedule = storage_adapter.get_training_schedule(shuffle=ssd_schedule_shuffle)
-        utils.print_rank_0(f"[SSD] Schedule ordering: {ssd_schedule_ordering}")
-        log_file.write(f"[SSD] Schedule ordering: {ssd_schedule_ordering}\n")
+        utils.log_and_print(
+            f"[SSD] Schedule ordering: {ssd_schedule_ordering}",
+            log_file,
+        )
 
         gaussians.offload_params_to_ssd_storage()
-        utils.print_rank_0("[PURE SSD] Training will use the SSD → RAM → GPU pipeline")
-
 
         gaussians.training_setup(opt_args)
 
         from storage.block_reader import TieredCacheBlockReader, resolve_block_reader_backend
 
         requested_backend = args.paper_block_reader_backend
-        resolved_backend = resolve_block_reader_backend(
-            requested_backend,
-            getattr(storage_adapter, 'execution_mode', 'paper'),
-        )
+        resolved_backend = resolve_block_reader_backend(requested_backend)
         if resolved_backend != 'tiered_cache':
             raise RuntimeError(
                 "train_tidegs.py requires paper_block_reader_backend=tiered_cache "
@@ -275,14 +318,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             filter_hint=storage_adapter.filter_cache_prefetch_candidates,
         )
 
-        utils.print_rank_0(
+        backend_msg = (
             f"[SSD] BlockReader backend = {resolved_backend} "
-            f"(requested={requested_backend}, ssd_execution_mode={storage_adapter.execution_mode})"
+            f"(requested={requested_backend})"
         )
-        log_file.write(
-            f"[SSD] BlockReader backend = {resolved_backend} "
-            f"(requested={requested_backend}, ssd_execution_mode={storage_adapter.execution_mode})\n"
-        )
+        utils.log_and_print(backend_msg, log_file)
 
         gaussians.free_unified_params()
         utils.print_rank_0(
@@ -292,10 +332,18 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
         _validate_pure_ssd_runtime(args, gaussians, storage_adapter, resolved_backend, log_file)
 
+        if storage_adapter is None:
+            raise RuntimeError(
+                "Pure SSD/Tide release path requires a TideStorageAdapter."
+            )
+        if ssd_training_schedule is None:
+            raise RuntimeError(
+                "Pure SSD/Tide release path requires a camera training schedule."
+            )
+
         if pure_ssd_resume_manifest is not None:
             msg = "[PURE SSD RESUME] GPUResidentAdam cold-started; Adam moments are not restored"
-            utils.print_rank_0(msg)
-            log_file.write(msg + "\n")
+            utils.log_and_print(msg, log_file)
 
         scene.log_scene_info_to_file(log_file, "Scene Info Before Training")
     utils.check_initial_gpu_memory_usage("after init and before training loop")
@@ -303,7 +351,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # ------------------------------------------------------------------------
     # 1.3: Initialize data loader
     # ------------------------------------------------------------------------
-    train_dataset = OffloadSceneDataset(scene.getTrainCamerasInfo())
+    train_dataset = OffloadSceneDataset(scene.getTrainCamerasInfo(), args)
 
     # ------------------------------------------------------------------------
     # 1.4: Initialize background and CUDA streams
@@ -326,14 +374,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         range(1, opt_args.iterations + 1),
         desc="Training progress",
     )
+    resources["progress_bar"] = progress_bar
     progress_bar.update(start_from_this_iteration - 1)
     num_trained_batches = 0
 
     mem_mon = MemMonitor(log_dir=args.model_path, warn_avail_gb=15.0)
-
-    # Random number generator for camera ordering in retention-based offloading
-    perm_generator = torch.Generator(device="cuda")
-    perm_generator.manual_seed(1)
+    resources["mem_mon"] = mem_mon
 
     # Training state variables
     ema_loss_for_log = 0
@@ -399,6 +445,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             return
         churn_tsv_path = os.path.join(args.model_path, 'optimizer_state_churn_by_epoch.tsv')
         optimizer_churn_tsv = open(churn_tsv_path, 'w', buffering=1)
+        resources["optimizer_churn_tsv"] = optimizer_churn_tsv
         optimizer_churn_tsv.write(
             'epoch\titeration_end\toptimizer_rows_updated\tcold_restarted_rows_updated\t'
             'cold_restarted_row_ratio_pct\tcold_restarts\tstate_evictions\tmean_resident_streak\n'
@@ -411,6 +458,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     gaussians._paper_optimizer_backend = 'gpu_resident'
     _enable_optimizer_churn_logging("pure_ssd_gpu_resident")
     camera_batch_prefetcher = CameraBatchPrefetcher(train_dataset)
+    resources["camera_batch_prefetcher"] = camera_batch_prefetcher
     initial_camera_schedule = get_camera_batch_schedule(
         training_schedule=ssd_training_schedule,
         iteration=start_from_this_iteration,
@@ -589,13 +637,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             gaussians=gaussians,
             scene=scene,
             batched_cameras=batched_cameras,
-            parameters_grad_buffer=gaussians.parameters_grad_buffer,
             background=background,
             pipe_args=pipe_args,
             comm_stream=comm_stream,
-            perm_generator=perm_generator,
             storage_adapter=storage_adapter,
             training_schedule=ssd_training_schedule,
+            runtime_args=args,
         )
 
         mem_mon.tick(iteration)
@@ -653,8 +700,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     "--checkpoint_iterations for resumable state, or "
                     "tools/export_pure_ssd_checkpoint_to_ply.py for PLY preview/export.\n"
                 )
-                utils.print_rank_0(skip_msg.rstrip())
-                log_file.write(skip_msg)
+                utils.log_and_print(skip_msg, log_file)
 
                 end2end_timers.start()
 
@@ -679,12 +725,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     "checkpoints",
                     str(checkpoint_iteration),
                 )
-                utils.print_rank_0(
+                checkpoint_msg = (
                     f"\n[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}"
                 )
-                log_file.write(
-                    f"[ITER {iteration}] Saving Pure SSD Checkpoint {checkpoint_iteration}\n"
-                )
+                utils.log_and_print(checkpoint_msg, log_file)
                 storage_adapter.drain_cache_writebacks()
                 pure_ssd_checkpoint_mode = str(
                     getattr(args, "pure_ssd_checkpoint_mode", "incremental")
@@ -759,11 +803,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             epoch_zero_based=optimizer_churn_state['current_epoch'],
             iteration_end=last_iteration if last_iteration is not None else opt_args.iterations,
         )
-        optimizer_churn_tsv.close()
-        optimizer_churn_tsv = None
 
     camera_prefetch_stats = camera_batch_prefetcher.get_stats()
-    camera_batch_prefetcher.close()
     log_file.write(
         "[CAMERA PREFETCH] "
         f"batches={camera_prefetch_stats['batches']} "
@@ -789,18 +830,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         )
     )
 
-    # Close progress bar and clean up scene
-    progress_bar.close()
-    mem_mon.close()
-
-    if storage_adapter is not None:
-        from strategies.tide_engine.engine import shutdown_double_buffer_gpu
-
-        storage_adapter.shutdown()
-        shutdown_double_buffer_gpu()
-
-    scene.clean_up()
-
     # Stop profiler if active
     if args.nsys_profile:
         torch.cuda.cudart().cudaProfilerStop()
@@ -814,46 +843,50 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    bench_p = BenchmarkParams(parser)
-    debug_p = DebugParams(parser)
+    bench_p = BenchmarkParams(parser) # TODO: check 一下是否真正用到
+    debug_p = DebugParams(parser) # TODO: check 一下是否真正用到
     args = parser.parse_args(sys.argv[1:])
 
-    init_args(args)
+    args = init_args(args)
 
-    args = utils.get_args()
+    log_file = None
+    try:
+        # create log folder
+        os.makedirs(args.model_path, exist_ok=True)
+        with open(args.log_folder + "/args.json", "w") as f:
+            json.dump(vars(args), f)
 
-    # create log folder
-    os.makedirs(args.log_folder, exist_ok=True)
-    os.makedirs(args.model_path, exist_ok=True)
-    with open(args.log_folder + "/args.json", "w") as f:
-        json.dump(vars(args), f)
+        # create cuda trace dump folder
+        if args.trace_cuda_mem:
+            os.makedirs(os.path.join(args.model_path, "trace_dump"))
 
-    # create cuda trace dump folder
-    if args.trace_cuda_mem:
-        os.makedirs(os.path.join(args.model_path, "trace_dump"))
+        # Initialize log file and print all args
+        log_file = open(
+            args.log_folder + "/python.log",
+            "a" if args.auto_start_checkpoint else "w",
+        )
+        utils.set_log_file(log_file)
 
-    # Initialize log file and print all args
-    log_file = open(
-        args.log_folder + "/python.log",
-        "a" if args.auto_start_checkpoint else "w",
-    )
-    utils.set_log_file(log_file)
+        # Initialize the selected GPU and system state.
+        torch.cuda.set_device(args.gpu)
+        safe_state(args.quiet, log_file=log_file)
 
-    # Initialize system state (RNG). In quiet mode regular stdout is mirrored to
-    # python.log, while tqdm progress bars still use stderr for terminal progress.
-    safe_state(args.quiet, log_file=log_file)
-    # torch.autograd.set_detect_anomaly(args.detect_anomaly)
+        print_all_args(args, log_file)
 
-    print_all_args(args, log_file)
+        p = psutil.Process()
+        log_file.write(
+            f"Initial pinned memory: {p.memory_info().shared / 1024 / 1024 / 1024} GB\n"
+        )
 
-    p = psutil.Process()
-    log_file.write(
-        f"Initial pinned memory: {p.memory_info().shared / 1024 / 1024 / 1024} GB\n"
-    )
+        training(lp.extract(args), op.extract(args), pp.extract(args), args, log_file)
 
-    training(lp.extract(args), op.extract(args), pp.extract(args), args, log_file)
-
-    # All done
-    utils.print_rank_0("\nTraining complete.")
-    log_file.flush()
-    log_file.close()
+        utils.print_rank_0("\nTraining complete.")
+    except BaseException as exc:
+        if log_file is not None:
+            log_file.write(f"\nTraining failed: {type(exc).__name__}: {exc}\n")
+            log_file.flush()
+        raise
+    finally:
+        if log_file is not None and not log_file.closed:
+            log_file.flush()
+            log_file.close()

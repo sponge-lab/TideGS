@@ -432,11 +432,8 @@ def calculate_filters(batched_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotati
                     f"[WARNING] {len(missing_cameras)}/{num_cameras} cameras see no Gaussians: "
                     f"{sorted(missing_cameras)[:10]}... (truncated)"
                 )
-            print(warning_msg)
             log_file = utils.get_log_file()
-            if log_file is not None:
-                log_file.write(warning_msg + "\n")
-                log_file.flush()
+            utils.log_and_print(warning_msg, log_file)
 
             if projection_verbose_enabled and len(missing_cameras) > 0:
                 first_missing = sorted(missing_cameras)[0]

@@ -49,16 +49,12 @@ class BaseGaussianModel(ABC):
 
         self.rotation_activation = torch.nn.functional.normalize
 
-    def __init__(self, sh_degree: int, only_for_rendering: bool = False):
-        args = utils.get_args()
+    def __init__(self, sh_degree: int, args, only_for_rendering: bool = False):
         self.args = args
 
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         self._parameters = torch.empty(0)
-        self.param_dims = torch.empty(0)
-        self.param_dims_presum_rshift = torch.empty(0)
-        self.col2attr = torch.empty(0)
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -188,7 +184,7 @@ class BaseGaussianModel(ABC):
 
     def save_ply(self, path):
         """Save model to PLY file"""
-        args = utils.get_args()
+        args = self.args
         _xyz = _features_dc = _features_rest = _opacity = _scaling = _rotation = None
         utils.log_cpu_memory_usage("start save_ply")
 
@@ -299,7 +295,7 @@ class BaseGaussianModel(ABC):
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        args = utils.get_args()
+        args = self.args
 
         if args.drop_initial_3dgs_p > 0.0:
             # drop each point with probability args.drop_initial_3dgs_p
@@ -362,7 +358,7 @@ class BaseGaussianModel(ABC):
         pass
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
-        args = utils.get_args()
+        args = self.args
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 

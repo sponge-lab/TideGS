@@ -54,7 +54,8 @@ PyTorch stack for your CUDA/platform first, then install the remaining Python
 dependencies and project extensions:
 
 ```bash
-git clone --recursive https://github.com/sponge-lab/TideGS.git
+git clone --single-branch --branch main --depth 1 \
+  https://github.com/sponge-lab/TideGS.git
 cd TideGS
 
 pip install -r requirements.txt
@@ -152,9 +153,44 @@ streaming_init_manifest.json
 `base_file.bin` stores the immutable initial `[N, 59]` float32 block array.
 Patch logs and checkpoints are written to the current run's SSD cache directory.
 
+To build the base offline (recommended for billion-point scenes) run:
+
+```bash
+python -m storage.streaming_ply_init --ply "$TIDEGS_DENSE_PLY" --output /path/to/ssd_base
+```
+
+and pass the generated `streaming_init_manifest.json` with `--manifest`. The
+default `--scale-mode knn3` initializes each Gaussian's scale from its three
+nearest neighbours, one Morton bucket at a time (GPU `distCUDA2` when available,
+scipy otherwise). Manifests built with the legacy
+`morton_bucket_density_clamped` mode still load; that mode is kept for
+compatibility and is not recommended for new large-scale bases.
+
 ## Training
 
-Run the recommended full-camera MatrixCity 1B configuration:
+Training always uses the Tide SSD → RAM → GPU path, including resident-block
+prefetch and synchronous loading when prefetch is unavailable. The legacy
+`--ssd_execution_mode` / `--storage_mode` selectors and
+`--enable_hotspot_retention` switch have been removed; omit them from older
+commands. GPU residency is controlled by the `--tide_resident_*` options.
+
+`--tide_resident_capacity_blocks` (launcher: `--capacity`) limits how many
+4096-Gaussian blocks are resident on the GPU during a training batch. Only
+resident blocks receive gradients and optimizer updates in that batch; blocks
+left out remain in storage and can be streamed in when a later batch selects
+them. The value
+trades GPU memory against coverage of dense views. It does not change the number
+of blocks stored in the base or in checkpoints, does not reduce the model, and
+does not limit how many visible blocks are rendered during evaluation. Size it
+from GPU memory, scene density, and runtime headroom (peak memory grows during
+training as splats grow); the launcher default of 2048 is a conservative
+smoke-run value, not a recommendation for 1B-scale training, and the launcher
+refuses a full-camera run (`--debug-max-train-cameras -1`) that does not pass
+`--capacity` explicitly. Concrete values belong in the launcher invocation or
+the run configuration (`args.json`).
+
+Run a short full-camera functional check (240 iterations; `--capacity 2048` is
+the smoke value, replace it for real training):
 
 ```bash
 GPU=0 \
@@ -187,11 +223,11 @@ training stdout is written to `python.log`. Use `--debug-logging` to add detaile
 runtime markers to `python.log`. Use `--verbose-terminal` only when actively
 debugging and you want the training subprocess to stream to the terminal.
 
-Recommended MatrixCity 1B settings:
+MatrixCity 1B launcher settings:
 
 ```text
 batch size: 16
-resident block capacity: 2048
+resident block capacity: explicit --capacity sized to GPU memory (2048 = smoke/debug default)
 schedule ordering: trajectory
 resident policy: balanced active-first TopC (topc_balanced_active_first)
 resident lambda: 0.3
@@ -253,14 +289,33 @@ use hard links by default, so creating a checkpoint does not duplicate their
 physical bytes. Use `--checkpoint-patch-mode copy` only when independent copies
 are required across filesystems.
 
-Patch storage is compacted automatically at 16 files or 64 GiB of reclaimable
-stale block versions. Compaction
-rewrites only the latest updated blocks, never the immutable base, and only
-garbage-collects patch paths owned by the current run. The newest two
-checkpoints are retained by default. These limits can be adjusted with
-`--max-patch-files`, `--max-patch-gb`, `--min-free-gb`, and
-`--checkpoint-keep-last`; writes stop before consuming the configured free-space
-reserve.
+Patch storage is compacted automatically at 16 patch files, 64 GiB of
+reclaimable stale block versions, or 128 GiB of total patch size (launcher
+defaults). Compaction rewrites only the latest updated blocks, never the
+immutable base, and only garbage-collects patch paths owned by the current run.
+The newest two checkpoints are retained by default. These limits can be adjusted
+with `--max-patch-files`, `--max-stale-patch-gb`, `--max-patch-total-gb`,
+`--min-free-gb`, and `--checkpoint-keep-last` (`-1` keeps all); writes stop
+before consuming the configured free-space reserve.
+
+## Evaluation
+
+`scripts/evaluate_missing_checkpoints.py` evaluates every complete checkpoint of
+a run that has no finished evaluation yet:
+
+```bash
+python scripts/evaluate_missing_checkpoints.py --run_dir /path/to/run
+```
+
+The default protocol renders a fixed, deterministic set of 200 test views
+(`linspace` over `transforms_test.json`, identical for every checkpoint) and
+reports per-view and mean PSNR and SSIM under
+`<run>/evaluations/iter<N>_views200_<id>/`, together with 10 fixed render/GT
+comparison images. Results are written after every view, and an interrupted
+evaluation resumes where it stopped. For each test camera the evaluator loads
+all blocks visible from that view, so metrics describe the full checkpoint
+model; evaluation is not truncated by `--tide_resident_capacity_blocks`. It uses
+its own cache and never modifies checkpoints or the training cache.
 
 ## Outputs
 
