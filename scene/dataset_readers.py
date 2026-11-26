@@ -456,6 +456,12 @@ def readCamerasFromTransformsCity(
     except:
         fovx = None
 
+    # transforms often carry the image size; use it instead of opening every
+    # file just to read its dimensions.
+    metadata_width = int(transforms.get("w", 0) or 0)
+    metadata_height = int(transforms.get("h", 0) or 0)
+    has_metadata_image_size = metadata_width > 0 and metadata_height > 0
+
     frames = transforms["frames"]
     max_debug_cameras = (
         args.debug_max_train_cameras if mode == "train" else args.debug_max_test_cameras
@@ -566,16 +572,21 @@ def readCamerasFromTransformsCity(
 
         image_path = cam_path
         image_name = cam_name
-        image = Image.open(image_path)
+        if has_metadata_image_size:
+            image = None
+            image_width, image_height = metadata_width, metadata_height
+        else:
+            image = Image.open(image_path)
+            image_width, image_height = image.size
 
         if fovx is not None:
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            fovy = focal2fov(fov2focal(fovx, image_width), image_height)
             FovY = fovy
             FovX = fovx
         else:
             # given focal in pixel unit
-            FovY = focal2fov(frame["fl_y"], image.size[1])
-            FovX = focal2fov(frame["fl_x"], image.size[0])
+            FovY = focal2fov(frame["fl_y"], image_height)
+            FovX = focal2fov(frame["fl_x"], image_width)
 
         cam_infos.append(
             CameraInfo(
@@ -587,15 +598,16 @@ def readCamerasFromTransformsCity(
                 image=None,
                 image_path=image_path,
                 image_name=image_name,
-                width=image.size[0],
-                height=image.size[1],
+                width=image_width,
+                height=image_height,
                 cam_center=Ts[idx],
                 image_cache_key=image_cache_key,
             )
         )
 
         # release memory
-        image.close()
+        if image is not None:
+            image.close()
         image = None
 
         if is_debug and idx > 128:
